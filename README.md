@@ -1,36 +1,54 @@
-# PPAH 2.0: Remote Session Security
+# PPAH 2.0: Privacy-Preserving Adaptive Hashing
 
-> **Privacy-Preserving Adaptive Hashing for Deepfake-Proof Remote Verification**
+> **Multi-Modal Continuous Identity Verification for the Post-Deepfake Era**
 
-[](https://opensource.org/licenses/MIT) [](https://www.google.com/search?q=https://github.com/Digho007/ppah)
+[](https://opensource.org/licenses/MIT) [](https://www.google.com/search?q=https://github.com/Digho007/ppah) [](https://en.wikipedia.org/wiki/Zero-knowledge_proof)
 
 ## 📖 Overview
 
-PPAH 2.0 is a **web-only, passwordless, and privacy-first** remote verification system designed to secure remote sessions against post-verification deepfake injection attacks.
+**PPAH 2.0** is a web-based, privacy-first security framework designed to verify remote users continuously without resorting to intrusive surveillance.
 
-Unlike traditional KYC tools that only verify a user once at the start, PPAH provides **continuous integrity monitoring**. It establishes a cryptographic baseline of the user's video feed and silently validates the stream in real-time. If a deepfake injection or virtual camera switch is attempted after authentication, the hash chain breaks, and the session is immediately frozen.
+Unlike traditional video calls (Zoom/Teams) that stream raw pixel data, PPAH uses **Client-Side Edge Computing** to analyze biometric and cryptographic signals locally. It transmits only mathematical hashes and digital signatures to the server, ensuring **Zero-Knowledge Privacy** while proving that the user is present, alive, and authorized.
 
-## 🚀 How It Works
+## 🚀 Key Innovations
 
-The system follows a zero-trust, zero-install flow:
+### 1\. Multi-Modal Security Architecture
 
-1.  **Device Attestation (WebAuthn):** The user clicks a secure link. Before accessing the camera, the system challenges the device using WebAuthn (Passkeys/TouchID/FaceID). This ensures the session is initiated by a human on a secure device, eliminating phishing and bot risks.
-2.  **Secure Baseline Creation:** Once authenticated, the system activates the camera for 3–5 seconds to confirm a physical video feed (blocking OBS/Virtual Cams) and generates the initial PPAH baseline hash.
-3.  **Continuous Adaptive Hashing:** The browser calculates cryptographic hashes of video segments locally. These hashes are sent to the backend to verify the **Chain of Custody**.
-4.  **Real-Time Threat Detection:** If a bad actor attempts to inject a deepfake or swap the video source, the hash immediately diverges from the expected sequence. The backend detects the anomaly and terminates the session instantly.
+The system employs a "Defense-in-Depth" strategy, layering four distinct security checks:
 
-## ✨ Key Features
+  * **Hardware Layer:** WebAuthn (FIDO2) attestation locks the session to a specific physical device.
+  * **Temporal Layer:** Cryptographic Hash Chaining (`SHA-256`) detects frame injection or deletion attacks.
+  * **Biometric Layer:** Real-time histogram and edge-density analysis locks the session to the specific user's facial signature.
+  * **Integrity Layer:** **HMAC-SHA256** packet signing prevents Man-in-the-Middle (MitM) replay attacks.
 
-  * **🚫 Passwordless & Phishing-Resistant:** Relies entirely on WebAuthn (FIDO2), removing the need for passwords, SMS OTPs, or vulnerable phone numbers.
-  * **🛡️ Deepfake Injection Proof:** Continuous monitoring ensures that the user verified at the start is the same user present 10 minutes later.
-  * **🔒 Privacy-First Architecture:** **Zero raw video data leaves the device.** All video processing and hashing occur client-side; only the cryptographic hashes are transmitted to the server.
-  * **🌐 Zero-Install Deployment:** Runs natively in any modern browser (Chrome, Safari, Edge) on mobile and desktop without requiring app downloads.
+### 2\. Adaptive Trust Scoring
 
-## 🛠️ Tech Stack
+Instead of a binary "Pass/Fail" that frustrates users, PPAH 3.0 uses an **Adaptive Trust Score (0-100)**.
 
-  * **Frontend:** React (Next.js/Vite), WebAuthn API, HTML5 Canvas (for frame processing).
-  * **Backend:** Python (FastAPI) for hash verification and session management.
-  * **Security:** SHA-256 for frame hashing, ECDSA/RSA for WebAuthn signatures.
+  * **Environmental Healing:** If lighting conditions change, the system lowers the trust score but continues monitoring. If the user remains consistent, the score "heals" back to 100%.
+  * **Rolling Anchors:** The biometric baseline evolves over time to adapt to natural environmental drift (e.g., sunset).
+
+### 3\. Ultra-Low Bandwidth
+
+By transmitting hashes instead of video, PPAH operates on **\< 1 Kbps** bandwidth, making high-security verification accessible in rural areas or on 2G/EDGE connections.
+
+## 🛠️ Technical Architecture
+
+### Frontend (Client)
+
+  * **Framework:** Next.js (React)
+  * **Processing:** **Web Workers** offload heavy computer vision tasks (histograms, frame differencing) to a background thread, maintaining 60 FPS UI performance.
+  * **Algorithms:**
+      * *Biometrics:* Bhattacharyya Distance (Color Histograms) & Laplacian Edge Detection.
+      * *Liveness:* Frame-to-frame motion energy & Color Temperature analysis.
+      * *Optimization:* `Canvas2D` with `willReadFrequently: true` for hardware acceleration.
+
+### Backend (Server)
+
+  * **Framework:** Python (FastAPI)
+  * **Verification:**
+      * **Sliding Window Logic:** Tolerates network packet loss (gaps of 1-2 frames) without breaking the security chain.
+      * **HMAC Verification:** Validates the cryptographic signature of every incoming heartbeat using a session-specific secret key.
 
 ## ⚡ Quick Start
 
@@ -39,40 +57,50 @@ The system follows a zero-trust, zero-install flow:
   * Node.js (v18+)
   * Python (v3.9+)
 
-### Installation
+### 1\. Setup Backend
 
-1.  **Clone the repository**
+```bash
+cd server
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install fastapi uvicorn
+uvicorn ppah_server:app --reload --host 0.0.0.0 --port 8000
+```
 
-    ```bash
-    git clone https://github.com/Digho007/ppah2.0.git
-    cd ppah2.0
-    ```
+### 2\. Setup Frontend
 
-2.  **Setup Backend**
+```bash
+cd ../client
+npm install
+npm run dev
+```
 
-    ```bash
-    cd server
-    python -m venv venv
-    source venv/bin/activate  # or venv\Scripts\activate on Windows
-    pip install fastapi uvicorn
-    uvicorn ppah_server:app --reload --host 0.0.0.0 --port 8000
-    ```
+### 3\. Run the System
 
-3.  **Setup Frontend**
+Open `http://localhost:3000` (or your VM IP) in a browser.
 
-    ```bash
-    cd ../client
-    npm install
-    npm run dev
-    ```
+## 🧪 Testing & Data Collection
 
-4.  **Access the App**
+To validate the system for research purposes, use the built-in simulation tools:
 
-      * Open `http://localhost:3000` (or your VM IP) in a browser.
+| Test Case | Action | Expected Outcome |
+| :--- | :--- | :--- |
+| **Normal Operation** | Run for 60s | Trust Score stays \> 90%. Logs show `[VERIFY] ... Segment X ✓`. |
+| **Injection Attack** | Click **"Simulate Attack"** button | Trust Score hits 0%. Server logs `[SECURITY] Segment sequence break`. |
+| **User Swap** | Have a different person enter frame | Console shows `[BIOMETRIC] Similarity: < 60%`. Trust Score drains. |
+| **Spoofing** | Hold up a static photo | Liveness score drops. System triggers "Turn Head" challenge. |
 
-## 🛡️ Privacy Notice
+## 🛡️ Privacy & Compliance
 
-This project adheres to strict privacy-by-design principles. Biometric data (video frames) is processed in volatile memory within the user's browser and is never stored or transmitted.
+This project helps organizations meet **GDPR, CCPA, and NDPR** data minimization requirements:
+
+1.  **No Face Storage:** Facial images are processed in volatile memory (RAM) and destroyed immediately.
+2.  **No Surveillance:** The server administrator cannot "watch" the user; they only see a cryptographic proof of presence.
+
+## 🔮 Future Work
+
+  * **Deep Learning Integration:** Replacing heuristic histograms with client-side TensorFlow.js (MediaPipe) for higher accuracy on high-end devices.
+  * **Zero-Knowledge Proofs (ZKP):** Implementing zk-SNARKs to prove liveness without revealing any biometric metadata.
 
 ## 📄 License
 
