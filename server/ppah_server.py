@@ -7,12 +7,11 @@ import hashlib
 import hmac
 import secrets
 import json
-import sqlite3  # <--- Persistence
+import sqlite3
 import os
 
 app = FastAPI(title="PPAH Enhanced Verification API")
 
-# Allow all origins (for local dev), but in production restrict this!
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -21,28 +20,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================================
-# DATABASE SETUP (SQLite)
-# ============================================================================
-
 DB_NAME = "ppah_enterprise.db"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # 1. Sessions Table
     c.execute('''CREATE TABLE IF NOT EXISTS sessions 
                  (session_id TEXT PRIMARY KEY, 
                   data TEXT, 
                   updated_at TIMESTAMP)''')
-    
-    # 2. Magic Links Table
     c.execute('''CREATE TABLE IF NOT EXISTS magic_links 
                  (token TEXT PRIMARY KEY, 
                   data TEXT, 
                   expires_at TIMESTAMP)''')
-                  
-    # 3. WebAuthn Credentials
     c.execute('''CREATE TABLE IF NOT EXISTS credentials 
                  (cred_id TEXT PRIMARY KEY, 
                   data TEXT)''')
@@ -50,10 +40,6 @@ def init_db():
     conn.close()
 
 init_db()
-
-# ============================================================================
-# DATA MODELS
-# ============================================================================
 
 class InitSessionRequest(BaseModel):
     email: Optional[EmailStr] = None
@@ -64,6 +50,7 @@ class VerifyHashRequest(BaseModel):
     session_id: str
     segment_id: int
     hash: str
+    trust_score: int # <--- NEW: Server receives the score
     signature: str 
 
 class ReAuthRequest(BaseModel):
@@ -72,10 +59,6 @@ class ReAuthRequest(BaseModel):
 
 class MagicLinkRequest(BaseModel):
     email: EmailStr
-
-# ============================================================================
-# SESSION LOGIC (With DB Persistence)
-# ============================================================================
 
 SESSION_TIMEOUT = 3600
 
@@ -86,7 +69,6 @@ class PPAHSession:
                  restore_data: dict = None):
         
         if restore_data:
-            # Rehydrate from DB
             self.session_id = restore_data['session_id']
             self.email = restore_data['email']
             self.created_at = datetime.fromisoformat(restore_data['created_at'])
@@ -100,7 +82,6 @@ class PPAHSession:
             self.camera_fingerprint_locked = restore_data['camera_locked']
             self.anomaly_log = restore_data['anomaly_log']
         else:
-            # New Session
             self.session_id = session_id
             self.email = email
             self.created_at = datetime.now()
@@ -114,11 +95,15 @@ class PPAHSession:
             self.camera_fingerprint_locked = camera_fingerprint is not None
             self.anomaly_log = []
         
-    def verify_signature(self, segment_id: int, hash_value: str, signature: str) -> bool:
+    def verify_signature(self, segment_id: int, hash_value: str, trust_score: int, signature: str) -> bool:
         if not self.session_key:
             self.log_anomaly("Missing session key for signature verification")
             return False 
-        message = f"{self.session_id}{segment_id}{hash_value}"
+        
+        # RECONSTRUCT MESSAGE: Must match client encoding exactly
+        # Message = SessionID + SegmentID + Hash + TrustScore
+        message = f"{self.session_id}{segment_id}{hash_value}{trust_score}"
+        
         try:
             expected_sig = hmac.new(
                 self.session_key.encode('utf-8'),
@@ -129,16 +114,22 @@ class PPAHSession:
             return False
         return hmac.compare_digest(expected_sig, signature)
 
-    def add_hash(self, segment_id: int, hash_value: str, signature: str) -> bool:
+    def add_hash(self, segment_id: int, hash_value: str, trust_score: int, signature: str) -> bool:
         self.last_activity = datetime.now()
         
-        # 1. Signature Check
-        if not self.verify_signature(segment_id, hash_value, signature):
+        # 1. Signature Check (Includes Trust Score)
+        if not self.verify_signature(segment_id, hash_value, trust_score, signature):
             self.log_anomaly(f"Invalid HMAC signature for segment {segment_id}")
             self.freeze("Packet signature verification failed - Possible spoofing")
             return False
 
-        # 2. Sliding Window
+        # 2. SERVER AUTHORITY CHECK (Mitigation 1)
+        if trust_score < 40:
+            self.log_anomaly(f"Trust score dropped below threshold: {trust_score}")
+            self.freeze("Biometric Trust Score Failed")
+            return False
+
+        # 3. Sliding Window
         expected = self.segment_count + 1
         if segment_id == expected:
             pass
@@ -154,6 +145,7 @@ class PPAHSession:
         self.hash_chain.append({
             'segment_id': segment_id,
             'hash': hash_value,
+            'trust_score': trust_score,
             'timestamp': datetime.now().isoformat()
         })
         self.segment_count = segment_id
@@ -207,13 +199,10 @@ class PPAHSession:
                 'hash_chain': True,
                 'packet_signing': True,
                 'camera_fingerprint': self.camera_fingerprint_locked,
-                'persistence': 'SQLite'
+                'persistence': 'SQLite',
+                'server_authority': True
             }
         }
-
-# ============================================================================
-# DB HELPERS
-# ============================================================================
 
 def save_session(session: PPAHSession):
     try:
@@ -239,10 +228,6 @@ def load_session(session_id: str) -> Optional[PPAHSession]:
         print(f"[DB ERROR] Load failed: {e}")
     return None
 
-# ============================================================================
-# API ENDPOINTS
-# ============================================================================
-
 @app.get('/api/auth/config')
 async def get_auth_config(request: Request):
     client_host = request.url.hostname
@@ -260,7 +245,7 @@ async def initialize_session(request: InitSessionRequest):
         camera_fingerprint=request.camera_fingerprint,
         session_key=session_key
     )
-    save_session(session) # Persist immediately
+    save_session(session) 
     
     print(f"[SESSION] Initialized {session_id[:8]}")
     return {
@@ -279,8 +264,9 @@ async def verify_hash(request: VerifyHashRequest):
     if not session.is_active(): 
         raise HTTPException(status_code=403, detail=f'Session {session.status}')
     
-    valid = session.add_hash(request.segment_id, request.hash, request.signature)
-    save_session(session) # Update DB
+    # PASS TRUST SCORE TO VALIDATION LOGIC
+    valid = session.add_hash(request.segment_id, request.hash, request.trust_score, request.signature)
+    save_session(session) 
     
     if not valid:
         return {
@@ -290,7 +276,7 @@ async def verify_hash(request: VerifyHashRequest):
             'action': 'reauth_required'
         }
     
-    print(f"[VERIFY] {session.session_id[:8]} - Segment {request.segment_id} ✓")
+    print(f"[VERIFY] {session.session_id[:8]} - Segment {request.segment_id} ✓ (Score: {request.trust_score})")
     return {
         'valid': True, 
         'segment_id': request.segment_id, 
@@ -310,14 +296,12 @@ async def root():
     return {
         'service': 'PPAH Enterprise API', 
         'status': 'running', 
-        'version': '3.0.0',
-        'storage': 'SQLite'
+        'version': '3.1.0',
+        'storage': 'SQLite',
+        'mode': 'Server Authority'
     }
 
 if __name__ == "__main__":
     import uvicorn
-    # INSTRUCTIONS FOR HTTPS:
-    # Generate certs: openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
-    # Run: uvicorn ppah_server:app --host 0.0.0.0 --port 8000 --ssl-keyfile key.pem --ssl-certfile cert.pem
     print("WARNING: Run with SSL in production to protect session keys!")
     uvicorn.run(app, host="0.0.0.0", port=8000)

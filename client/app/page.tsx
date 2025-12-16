@@ -1,6 +1,6 @@
 "use client";
 import React, { useState, useRef, useEffect } from 'react';
-import { Shield, Lock, AlertTriangle, Zap } from 'lucide-react';
+import { Shield, Lock, AlertTriangle } from 'lucide-react';
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 
 const PPAHVerification = () => {
@@ -20,24 +20,27 @@ const PPAHVerification = () => {
   const streamRef = useRef<MediaStream | null>(null);
   const monitoringRef = useRef<NodeJS.Timeout | null>(null);
   const previousHashRef = useRef<Uint8Array | null>(null);
-  const attackModeRef = useRef(false);
   
   // Security Refs
   const sessionKeyRef = useRef<string | null>(null);
   const anchorBiometricRef = useRef<any | null>(null);
-  const goldenAnchorRef = useRef<any | null>(null); // ✅ PERSISTED: Anti-Drift Golden Anchor
+  const goldenAnchorRef = useRef<any | null>(null); // Anti-Drift Anchor
   const cameraFingerprintRef = useRef<string | null>(null);
   const workerRef = useRef<Worker | null>(null);
   
+  // Logic Refs
   const stepRef = useRef(step); 
+  const trustScoreRef = useRef(trustScore); 
   const challengeActiveRef = useRef(false);
   const previousFramesRef = useRef<ImageData[]>([]);
   const biometricFailuresRef = useRef(0);
   const landmarkerRef = useRef<FaceLandmarker | null>(null);
 
+  // Sync Refs
   useEffect(() => { stepRef.current = step; }, [step]);
+  useEffect(() => { trustScoreRef.current = trustScore; }, [trustScore]);
 
-  // --- 1. INITIALIZE MEDIAPIPE (✅ KEPT REAL CHECK) ---
+  // --- 1. INITIALIZE MEDIAPIPE ---
   useEffect(() => {
     const loadModel = async () => {
       try {
@@ -61,9 +64,8 @@ const PPAHVerification = () => {
     loadModel();
   }, []);
 
-  // --- CONFIG (UPDATED: HTTP ONLY) ---
+  // --- CONFIG (HTTP for Localhost) ---
   const getBackendUrl = () => {
-    // ⚠️ CHANGED: Reverted to HTTP for local development without SSL
     if (typeof window === 'undefined') return 'http://localhost:8000';
     return `http://${window.location.hostname}:8000`;
   };
@@ -92,13 +94,12 @@ const PPAHVerification = () => {
       }
       else if (type === 'ANCHOR_GENERATED') {
         anchorBiometricRef.current = fingerprint;
-        goldenAnchorRef.current = fingerprint; // ✅ STORE GOLDEN ANCHOR
+        goldenAnchorRef.current = fingerprint; 
         setBiometricLocked(true);
         console.log('[BIOMETRIC] Baseline & Golden Anchor set');
       }
       else if (type === 'ANCHOR_UPDATED') {
         anchorBiometricRef.current = fingerprint;
-        // NOTE: We do NOT update goldenAnchorRef here to prevent drift!
         console.log('[ADAPTIVE] Rolling anchor updated (Drift check passed)');
       }
     };
@@ -123,11 +124,12 @@ const PPAHVerification = () => {
     return result;
   };
 
-  const signPacket = async (sessionId: string, segmentId: number, hash: string) => {
+  const signPacket = async (sessionId: string, segmentId: number, hash: string, score: number) => {
     if (!sessionKeyRef.current) return "unsigned"; 
     const encoder = new TextEncoder();
     const keyData = encoder.encode(sessionKeyRef.current);
-    const message = encoder.encode(`${sessionId}${segmentId}${hash}`);
+    // Signature includes Trust Score for server-side verification
+    const message = encoder.encode(`${sessionId}${segmentId}${hash}${score}`);
     try {
       const key = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
       const signature = await crypto.subtle.sign("HMAC", key, message);
@@ -173,7 +175,6 @@ const PPAHVerification = () => {
     const startTime = Date.now();
     let passed = false;
 
-    // ✅ KEPT REAL MEDIAPIPE LOGIC
     while (Date.now() - startTime < 5000) {
         if (videoRef.current && landmarkerRef.current) {
             const now = performance.now();
@@ -324,7 +325,6 @@ const PPAHVerification = () => {
 
   const startMonitoring = (activeSessionId: string) => {
     let segmentCounter = 1;
-    attackModeRef.current = false;
 
     monitoringRef.current = setInterval(async () => {
       try {
@@ -345,7 +345,7 @@ const PPAHVerification = () => {
                 imageData: imageData,
                 previousFrames: previousFramesRef.current, 
                 anchorBiometric: anchorBiometricRef.current,
-                goldenAnchor: goldenAnchorRef.current // ✅ PASS GOLDEN ANCHOR
+                goldenAnchor: goldenAnchorRef.current 
             });
         }
 
@@ -355,9 +355,10 @@ const PPAHVerification = () => {
         const currentHashBuffer = await crypto.subtle.digest('SHA-256', chainedData);
         const currentHashHex = arrayBufferToHex(currentHashBuffer);
 
-        const isAttack = attackModeRef.current;
-        const segmentToSend = isAttack ? segmentCounter + 100 : segmentCounter;
-        const signature = await signPacket(activeSessionId, segmentToSend, currentHashHex);
+        const segmentToSend = segmentCounter;
+        
+        const currentScore = trustScoreRef.current; 
+        const signature = await signPacket(activeSessionId, segmentToSend, currentHashHex, currentScore);
 
         const backendUrl = getBackendUrl();
         const response = await fetch(`${backendUrl}/api/verify-hash`, {
@@ -367,6 +368,7 @@ const PPAHVerification = () => {
             session_id: activeSessionId,
             segment_id: segmentToSend,
             hash: currentHashHex,
+            trust_score: currentScore,
             signature: signature 
           })
         }).catch(e => null);
@@ -400,7 +402,6 @@ const PPAHVerification = () => {
 
   const startVerification = async () => {
     setError(null);
-    attackModeRef.current = false;
     setBiometricLocked(false);
     await performWebAuthn(); 
     await new Promise(r => setTimeout(r, 500));
@@ -420,11 +421,6 @@ const PPAHVerification = () => {
     setTrustScore(100);
     setBiometricLocked(false);
     sessionKeyRef.current = null; 
-  };
-
-  const triggerAttack = () => {
-    attackModeRef.current = true;
-    setStatusMessage('INJECTING FAKE FRAMES...');
   };
 
   return (
@@ -502,12 +498,7 @@ const PPAHVerification = () => {
                    <Shield size={20} /> Initialize Secure Session
                 </button>
              ) : (
-                <>
-                  <button onClick={stopVerification} className="flex-1 bg-slate-600 hover:bg-slate-500 text-white font-bold py-4 rounded-lg">Terminate</button>
-                  <button onClick={triggerAttack} className="flex-1 bg-orange-600 hover:bg-orange-500 text-white font-bold py-4 rounded-lg flex items-center justify-center gap-2">
-                     <Zap size={20} /> Simulate Attack
-                  </button>
-                </>
+                <button onClick={stopVerification} className="flex-1 bg-slate-600 hover:bg-slate-500 text-white font-bold py-4 rounded-lg">Terminate</button>
              )}
           </div>
 
