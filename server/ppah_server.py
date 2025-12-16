@@ -4,7 +4,7 @@ from pydantic import BaseModel, EmailStr
 from typing import Dict, Optional, List
 from datetime import datetime, timedelta
 import hashlib
-import hmac  # <--- NEW: For packet signing
+import hmac
 import secrets
 import json
 import time
@@ -32,7 +32,7 @@ class VerifyHashRequest(BaseModel):
     session_id: str
     segment_id: int
     hash: str
-    signature: str # <--- NEW: HMAC Signature from client
+    signature: str 
 
 class ReAuthRequest(BaseModel):
     session_id: str
@@ -57,7 +57,7 @@ SESSION_TIMEOUT = 3600
 class PPAHSession:
     def __init__(self, session_id: str, email: Optional[str] = None, 
                  camera_fingerprint: Optional[str] = None,
-                 session_key: str = None): # <--- NEW: Shared Secret
+                 session_key: str = None):
         self.session_id = session_id
         self.email = email
         self.created_at = datetime.now()
@@ -77,21 +77,29 @@ class PPAHSession:
     def verify_signature(self, segment_id: int, hash_value: str, signature: str) -> bool:
         """
         Verify that the packet was signed by the client using the session key.
-        Prevents man-in-the-middle and script-kiddy injection attacks.
+        Prevents man-in-the-middle and injection attacks.
         """
+        # STRICT SECURITY: If no key exists, we cannot verify, so we must fail.
         if not self.session_key:
-            return True # Allow unsigned if key negotiation failed (Prototype fallback)
+            self.log_anomaly("Missing session key for signature verification")
+            return False 
             
-        # Reconstruct the message: session_id + segment_id + hash
+        # Reconstruct the message exactly as the client builds it:
+        # message = sessionId + segmentId + hash
         message = f"{self.session_id}{segment_id}{hash_value}"
         
-        # Compute expected HMAC
-        expected_sig = hmac.new(
-            self.session_key.encode(),
-            message.encode(),
-            hashlib.sha256
-        ).hexdigest()
+        # Compute expected HMAC-SHA256 signature
+        try:
+            expected_sig = hmac.new(
+                self.session_key.encode('utf-8'),
+                message.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+        except Exception as e:
+            print(f"[ERROR] HMAC calculation failed: {e}")
+            return False
         
+        # Secure comparison to prevent timing attacks
         return hmac.compare_digest(expected_sig, signature)
 
     def add_hash(self, segment_id: int, hash_value: str, signature: str) -> bool:
@@ -262,7 +270,6 @@ async def verify_magic_link(token: str):
     token_data['used'] = True
     
     session_id = secrets.token_hex(16)
-    # Generate session key for signature verification
     session_key = secrets.token_hex(32)
     
     session = PPAHSession(session_id, email=token_data['email'], session_key=session_key)
@@ -271,7 +278,7 @@ async def verify_magic_link(token: str):
     return {
         'success': True, 
         'session_id': session_id,
-        'session_key': session_key, # Send key to client
+        'session_key': session_key, 
         'email': token_data['email']
     }
 
@@ -306,7 +313,7 @@ async def authenticate_webauthn(data: dict):
     WEBAUTHN_CREDENTIALS[credential_id]['last_used'] = datetime.now().isoformat()
     
     session_id = secrets.token_hex(16)
-    session_key = secrets.token_hex(32) # Generate session key
+    session_key = secrets.token_hex(32) 
     
     email = WEBAUTHN_CREDENTIALS[credential_id]['email']
     session = PPAHSession(session_id, email=email, session_key=session_key)
@@ -315,7 +322,7 @@ async def authenticate_webauthn(data: dict):
     return {
         'success': True, 
         'session_id': session_id,
-        'session_key': session_key, # Send key to client
+        'session_key': session_key,
         'email': email
     }
 
@@ -323,14 +330,13 @@ async def authenticate_webauthn(data: dict):
 async def initialize_session(request: InitSessionRequest):
     """Initialize new verification session with optional camera fingerprint"""
     session_id = secrets.token_hex(16)
-    # Generate cryptographic key for this session
     session_key = secrets.token_hex(32)
     
     session = PPAHSession(
         session_id, 
         email=request.email,
         camera_fingerprint=request.camera_fingerprint,
-        session_key=session_key # Store for server-side verify
+        session_key=session_key
     )
     SESSIONS[session_id] = session
     
@@ -338,7 +344,7 @@ async def initialize_session(request: InitSessionRequest):
     
     return {
         'session_id': session_id,
-        'session_key': session_key, # Send to client for signing
+        'session_key': session_key,
         'status': 'initialized',
         'camera_locked': session.camera_fingerprint_locked
     }
@@ -357,7 +363,6 @@ async def verify_hash(request: VerifyHashRequest):
         raise HTTPException(status_code=403, detail=f'Session {session.status}')
     
     # Validate hash sequence AND signature
-    # We pass the signature from the request to the session logic
     if not session.add_hash(request.segment_id, request.hash, request.signature):
         return {
             'valid': False, 
@@ -420,7 +425,7 @@ async def root():
         'status': 'running', 
         'version': '2.2.0',
         'features': [
-            'HMAC Packet Signing',
+            'HMAC Packet Signing (STRICT)',
             'Sliding Window Network Logic',
             'Camera Fingerprinting',
             'Biometric Anchoring (Client-side)',
@@ -446,10 +451,10 @@ async def get_stats():
 if __name__ == "__main__":
     import uvicorn
     print("=" * 60)
-    print("PPAH Enhanced Verification Server v2.2.0")
+    print("PPAH Enhanced Verification Server v2.2.0 (SECURED)")
     print("=" * 60)
     print("Features:")
-    print("  ✓ HMAC-SHA256 Packet Signing")
+    print("  ✓ HMAC-SHA256 Packet Signing (Enforced)")
     print("  ✓ Robust Network Sliding Window")
     print("  ✓ Camera Device Fingerprinting")
     print("  ✓ Security Anomaly Logging")

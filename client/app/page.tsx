@@ -1,6 +1,8 @@
 "use client";
 import React, { useState, useRef, useEffect } from 'react';
-import { Camera, Shield, Lock, AlertTriangle, CheckCircle, Zap, Eye, User, Activity } from 'lucide-react';
+import { Shield, Lock, AlertTriangle, Zap } from 'lucide-react';
+// 1. Import MediaPipe
+import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 
 const PPAHVerification = () => {
   // --- STATE ---
@@ -29,14 +31,41 @@ const PPAHVerification = () => {
   const cameraFingerprintRef = useRef<string | null>(null);
   const workerRef = useRef<Worker | null>(null);
   
-  // Logic Refs (Avoid Stale State in Loops)
+  // Logic Refs
   const stepRef = useRef(step); 
   const challengeActiveRef = useRef(false);
   const previousFramesRef = useRef<ImageData[]>([]);
   const biometricFailuresRef = useRef(0);
 
+  // MediaPipe Ref (For Real Liveness)
+  const landmarkerRef = useRef<FaceLandmarker | null>(null);
+
   // Sync Step Ref
   useEffect(() => { stepRef.current = step; }, [step]);
+
+  // --- 1. INITIALIZE MEDIAPIPE (Background Load) ---
+  useEffect(() => {
+    const loadModel = async () => {
+      try {
+        const filesetResolver = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+        landmarkerRef.current = await FaceLandmarker.createFromOptions(filesetResolver, {
+          baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+            delegate: "GPU"
+          },
+          outputFaceBlendshapes: true,
+          runningMode: "VIDEO",
+          numFaces: 1
+        });
+        console.log("MediaPipe Loaded & Ready for Anomalies");
+      } catch (err) {
+        console.error("Failed to load AI:", err);
+      }
+    };
+    loadModel();
+  }, []);
 
   // --- CONFIG ---
   const getBackendUrl = () => {
@@ -52,14 +81,14 @@ const PPAHVerification = () => {
       const { type, liveness, similarity, fingerprint } = e.data;
 
       if (type === 'ANALYSIS_RESULT') {
-        // 1. Liveness Check
+        // 1. Liveness Check (Motion based)
         if (typeof liveness === 'number') {
           setLivenessScore(Math.round(liveness));
         }
 
         // 2. Biometric Check (With Guard Clause)
         if (typeof similarity === 'number' && anchorBiometricRef.current) {
-          
+          // If similarity drops, we trigger the "Smart" handler
           if (similarity < 0.60) {
             handleBiometricMismatchSmart(similarity);
           } else {
@@ -67,7 +96,6 @@ const PPAHVerification = () => {
             setTrustScore(prev => Math.min(100, prev + 5)); 
             biometricFailuresRef.current = 0; 
             
-            // Only update text if we are strictly monitoring
             if (!challengeActiveRef.current && stepRef.current === 'monitoring') {
                 setStatusMessage('System Secure - Monitoring');
             }
@@ -80,7 +108,6 @@ const PPAHVerification = () => {
         console.log('[BIOMETRIC] Anchor created via Worker');
       }
       else if (type === 'ANCHOR_UPDATED') {
-        // Rolling Update: Adapt to lighting changes
         anchorBiometricRef.current = fingerprint;
         console.log('[ADAPTIVE] Anchor evolved for lighting drift');
       }
@@ -90,7 +117,7 @@ const PPAHVerification = () => {
       cleanupResources();
       workerRef.current?.terminate();
     };
-  }, []); // <--- EMPTY DEPENDENCY: Prevents Camera from Stopping
+  }, []);
 
   const cleanupResources = () => {
     if (streamRef.current) {
@@ -134,7 +161,7 @@ const PPAHVerification = () => {
     }
   };
 
-  // --- TRUST LOGIC ---
+  // --- TRUST LOGIC & REAL LIVENESS CHALLENGE ---
   const [livenessScore, setLivenessScore] = useState(0);
   const [challengeActive, setChallengeActive] = useState(false);
   const [currentChallenge, setCurrentChallenge] = useState<string | null>(null);
@@ -149,6 +176,7 @@ const PPAHVerification = () => {
            handleBiometricMismatch(similarity);
            return 0;
         } 
+        // Trigger Challenge if Trust drops below 60
         if (newScore < 60) {
            setStatusMessage('⚠️ Analysing identity... Please hold still');
            if (!challengeActiveRef.current) {
@@ -159,17 +187,63 @@ const PPAHVerification = () => {
     });
   };
 
-  const challenges = ["Turn head left", "Turn head right", "Smile", "Blink twice"];
+  // --- NEW: REAL MEDIAPIPE CHALLENGE ---
   const triggerLivenessChallenge = async () => {
-    if (challengeActiveRef.current) return;
-    const challenge = challenges[Math.floor(Math.random() * challenges.length)];
+    if (challengeActiveRef.current || !landmarkerRef.current) return;
     
-    setCurrentChallenge(challenge);
+    // 1. Setup Challenge
+    const challenges = [
+        { text: "Turn Head LEFT", check: (yaw: number) => yaw < -0.02 }, // Left Ear further back
+        { text: "Turn Head RIGHT", check: (yaw: number) => yaw > 0.02 }  // Left Ear closer
+    ];
+    const selected = challenges[Math.floor(Math.random() * challenges.length)];
+    
+    setCurrentChallenge(selected.text);
     setChallengeActive(true);
     challengeActiveRef.current = true;
-    
-    await new Promise(r => setTimeout(r, 4000));
-    
+    setStatusMessage('⚠️ SECURITY CHECK: Verify Liveness');
+
+    // 2. Start Checking Loop (5 Seconds max)
+    const startTime = Date.now();
+    let passed = false;
+
+    // We pause strict monitoring updates briefly to focus on the challenge
+    // but the worker loop keeps running in background.
+
+    while (Date.now() - startTime < 5000) {
+        if (videoRef.current && landmarkerRef.current) {
+            const now = performance.now();
+            const results = landmarkerRef.current.detectForVideo(videoRef.current, now);
+
+            if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+                const landmarks = results.faceLandmarks[0];
+                // Landmark 234: Left Ear, 454: Right Ear
+                const leftEarZ = landmarks[234].z;
+                const rightEarZ = landmarks[454].z;
+                const yaw = leftEarZ - rightEarZ;
+
+                if (selected.check(yaw)) {
+                    passed = true;
+                    break;
+                }
+            }
+        }
+        await new Promise(r => setTimeout(r, 100)); // Check every 100ms
+    }
+
+    // 3. Result
+    if (passed) {
+        // Boost Trust significantly on pass
+        setTrustScore(prev => Math.min(100, prev + 25));
+        setStatusMessage('Liveness Verified ✅');
+        await new Promise(r => setTimeout(r, 1000)); // Show success briefly
+    } else {
+        // Punish Failure
+        setTrustScore(prev => Math.max(0, prev - 40));
+        setStatusMessage('Liveness Failed ❌');
+        // If trust hits 0, the next loop will kill the session
+    }
+
     setChallengeActive(false);
     setCurrentChallenge(null);
     challengeActiveRef.current = false;
@@ -192,8 +266,7 @@ const PPAHVerification = () => {
     setStatusMessage('Authenticating with passkey...');
     try {
       if (!window.PublicKeyCredential) throw new Error('WebAuthn not supported');
-      const backendUrl = getBackendUrl();
-      // Demo Mode: We proceed even if WebAuthn fails (for testing ease)
+      // Demo Mode: We proceed even if WebAuthn fails
       return true; 
     } catch (err) {
       return true; 
@@ -446,7 +519,7 @@ const PPAHVerification = () => {
         </div>
 
         <div className="relative bg-black h-[400px] flex items-center justify-center">
-          <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
+          <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover transform scale-x-[-1]" />
           
           {/* Overlays */}
           <div className="absolute top-4 left-4 right-4 flex justify-between items-start">
@@ -468,10 +541,10 @@ const PPAHVerification = () => {
             </div>
           )}
 
-          {/* Liveness Score */}
+          {/* Liveness Score (Motion) */}
           {livenessScore > 0 && step === 'monitoring' && (
             <div className="absolute bottom-4 right-4 bg-black/70 backdrop-blur px-3 py-2 rounded-lg text-xs">
-              <div className="text-slate-400 mb-1">Liveness</div>
+              <div className="text-slate-400 mb-1">Motion Detect</div>
               <div className="flex items-center gap-2">
                 <div className="w-24 h-2 bg-slate-700 rounded-full overflow-hidden">
                   <div className={`h-full transition-all ${livenessScore > 70 ? 'bg-green-500' : 'bg-yellow-500'}`} style={{ width: `${livenessScore}%` }} />
@@ -530,7 +603,7 @@ const PPAHVerification = () => {
                <div className={`text-sm font-bold ${biometricLocked ? 'text-green-400' : 'text-slate-400'}`}>{biometricLocked ? 'LOCKED' : '-'}</div>
             </div>
             <div className="bg-slate-700/50 p-3 rounded border border-slate-600">
-               <div className="text-slate-400 text-[10px] uppercase">Encryption</div>
+               <div className="text-slate-400 text-[10px] uppercase">Integrity</div>
                <div className={`text-sm font-bold ${sessionKeyRef.current ? 'text-green-400' : 'text-slate-400'}`}>{sessionKeyRef.current ? 'HMAC-256' : 'NONE'}</div>
             </div>
             <div className="bg-slate-700/50 p-3 rounded border border-slate-600">
