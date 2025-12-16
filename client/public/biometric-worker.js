@@ -1,39 +1,44 @@
 // client/public/biometric-worker.js
 
 self.onmessage = async (e) => {
-  const { type, imageData, previousFrames, anchorBiometric } = e.data;
+  const { type, imageData, previousFrames, anchorBiometric, goldenAnchor } = e.data;
 
   if (type === 'ANALYZE_FRAME') {
-    // 1. Normalize Lighting
+    // 1. Normalize
     const normalizedData = applyLightingNormalization(imageData);
-
-    // 2. Compute Fingerprint
     const fingerprint = createBiometricFingerprint(normalizedData);
     
-    // 3. Compute Liveness
+    // 2. Liveness (Motion)
     let liveness = 0;
     if (previousFrames && previousFrames.length >= 2) {
       liveness = computeLivenessScore(imageData, previousFrames);
     }
 
-    // 4. Compare with Anchor
+    // 3. Compare with Anchors (Dual Check)
     let similarity = 0;
-    if (anchorBiometric) {
-      similarity = compareBiometrics(fingerprint, anchorBiometric);
-
-      // --- NEW: ROLLING ANCHOR UPDATE ---
-      // If the match is very strong (>90%), we assume the user is valid 
-      // and slightly blend the current frame into the anchor.
-      // This allows the system to adapt to "Sunset" or "Lights Dimming" automatically.
-      if (similarity > 0.90) {
-         const newAnchor = blendBiometrics(anchorBiometric, fingerprint, 0.05); // 5% adaptation rate
-         
-         // Send the updated anchor back to the main thread
-         self.postMessage({
-            type: 'ANCHOR_UPDATED',
-            fingerprint: newAnchor
-         });
-      }
+    
+    if (anchorBiometric && goldenAnchor) {
+        // A. Rolling Anchor Check (Adapts to lighting)
+        const rollingScore = compareBiometrics(fingerprint, anchorBiometric);
+        
+        // B. Golden Anchor Check (Strict Identity)
+        const goldenScore = compareBiometrics(fingerprint, goldenAnchor);
+        
+        // C. Weighted Score (Favor Golden Anchor to prevent drift)
+        similarity = (rollingScore * 0.4) + (goldenScore * 0.6);
+        
+        // Update Rolling Anchor ONLY if match is very high
+        if (similarity > 0.90) {
+            const newRolling = blendBiometrics(anchorBiometric, fingerprint, 0.05);
+            self.postMessage({
+                type: 'ANCHOR_UPDATED',
+                fingerprint: newRolling
+            });
+        }
+    } 
+    else if (anchorBiometric) {
+        // Fallback (Initialization phase)
+        similarity = compareBiometrics(fingerprint, anchorBiometric);
     }
 
     self.postMessage({
@@ -46,24 +51,17 @@ self.onmessage = async (e) => {
   else if (type === 'GENERATE_ANCHOR') {
     const normalizedData = applyLightingNormalization(imageData);
     const fingerprint = createBiometricFingerprint(normalizedData);
+    // Return this as BOTH the initial rolling anchor AND the golden anchor
     self.postMessage({ type: 'ANCHOR_GENERATED', fingerprint });
   }
 };
 
-// --- HELPERS ---
+// --- HELPERS (Unchanged from original logic, just condensed for copy-paste) ---
 
 function blendBiometrics(oldBio, newBio, rate) {
-    // Weighted Average: New = (Old * 0.95) + (New * 0.05)
-    const newHist = oldBio.histogram.map((val, i) => 
-        (val * (1 - rate)) + (newBio.histogram[i] * rate)
-    );
-    
+    const newHist = oldBio.histogram.map((val, i) => (val * (1 - rate)) + (newBio.histogram[i] * rate));
     const newEdge = (oldBio.edgeDensity * (1 - rate)) + (newBio.edgeDensity * rate);
-    
-    return {
-        histogram: newHist,
-        edgeDensity: newEdge
-    };
+    return { histogram: newHist, edgeDensity: newEdge };
 }
 
 function applyLightingNormalization(imageData) {
@@ -72,10 +70,8 @@ function applyLightingNormalization(imageData) {
   for (let i = 0; i < data.length; i += 4) {
     const r = data[i], g = data[i+1], b = data[i+2];
     const sum = r + g + b + 1; 
-    newData[i] = (r / sum) * 255;     
-    newData[i+1] = (g / sum) * 255;   
-    newData[i+2] = (r + g + b) / 3;   
-    newData[i+3] = 255;               
+    newData[i] = (r / sum) * 255; newData[i+1] = (g / sum) * 255;   
+    newData[i+2] = (r + g + b) / 3; newData[i+3] = 255;               
   }
   return { width, height, data: newData };
 }
@@ -111,8 +107,7 @@ function computeColorHistogram(imageData) {
     const r = Math.floor(data[i]/32), g = Math.floor(data[i+1]/32), b = Math.floor(data[i+2]/32);
     histogram[r*64 + g*8 + b]++;
   }
-  const total = imageData.width * imageData.height;
-  return histogram.map(count => count / total);
+  return histogram.map(count => count / (imageData.width * imageData.height));
 }
 
 function extractEdgeDensity(imageData) {
@@ -120,10 +115,7 @@ function extractEdgeDensity(imageData) {
   let edgeCount = 0;
   const width = imageData.width;
   for (let i = 0; i < data.length - width * 4 - 4; i += 4) {
-    const current = data[i];
-    const right = data[i + 4];
-    const below = data[i + width * 4];
-    if (Math.abs(current - right) > 100 || Math.abs(current - below) > 100) edgeCount++;
+    if (Math.abs(data[i] - data[i+4]) > 100 || Math.abs(data[i] - data[i+width*4]) > 100) edgeCount++;
   }
   return edgeCount / (imageData.width * imageData.height);
 }
@@ -137,7 +129,6 @@ function compareBiometrics(b1, b2) {
 }
 
 function computeLivenessScore(current, prevFrames) {
-  let motion = 0;
   const currData = current.data;
   const prevData = prevFrames[prevFrames.length - 1].data;
   let diff = 0, samples = 0;
@@ -145,6 +136,5 @@ function computeLivenessScore(current, prevFrames) {
     diff += Math.abs(currData[i] - prevData[i]);
     samples++;
   }
-  motion = diff / samples;
-  return Math.min(motion / 10, 1.0) * 100;
+  return Math.min((diff / samples) / 10, 1.0) * 100;
 }
