@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "PPAH - Proof of Authentic Human",
-  description: "Passwordless, Deepfake-Proof Verification System",
+  title: "PPAH - Privacy-Preserving Adaptive Hashing",
+  description: "Passwordless, Deepfake-Proof Verification System for Remote Sessions developed by Jeremiah Dighomanor",
 };
 
 export default function RootLayout({

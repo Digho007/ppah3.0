@@ -1,527 +1,617 @@
 "use client";
 import React, { useState, useRef, useEffect } from 'react';
-import { Shield, Lock, AlertTriangle } from 'lucide-react';
+import { Shield, Phone, PhoneOff, UserX, Fingerprint, PlusCircle, Move, Users, User } from 'lucide-react';
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
+
+// --- 1. ERROR SUPPRESSION ---
+if (typeof window !== 'undefined') {
+  const originalError = console.error;
+  const originalInfo = console.info;
+
+  console.error = (...args) => {
+    if (/NotAllowedError/.test(args[0]?.toString())) return;
+    if (/Created TensorFlow Lite XNNPACK delegate for CPU/.test(args[0]?.toString())) return;
+    originalError.call(console, ...args);
+  };
+
+  console.info = (...args) => {
+    if (/Created TensorFlow Lite XNNPACK delegate for CPU/.test(args[0]?.toString())) return;
+    originalInfo.call(console, ...args);
+  };
+}
 
 const PPAHVerification = () => {
   // --- STATE ---
   const [step, setStep] = useState('idle');
+  const [userEmail, setUserEmail] = useState("user@example.com");
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [anchorHash, setAnchorHash] = useState<string | null>(null);
-  const [segmentCount, setSegmentCount] = useState(0);
-  const [error, setError] = useState<string | null>(null);
-  const [statusMessage, setStatusMessage] = useState('Ready to start verification');
-  const [biometricLocked, setBiometricLocked] = useState(false);
+  const [roomId, setRoomId] = useState('');
+  const [tempRoomId, setTempRoomId] = useState('');
+  const [statusMessage, setStatusMessage] = useState('Ready');
   const [trustScore, setTrustScore] = useState(100);
+  const [remoteTrustScore, setRemoteTrustScore] = useState<number | null>(null);
+  const [remoteSessionId, setRemoteSessionId] = useState<string | null>(null);
+  const [inCall, setInCall] = useState(false);
+  
+  // UI State
+  const [faceDetected, setFaceDetected] = useState(true);
+  const [challengeActive, setChallengeActive] = useState(false);
+  const [currentChallenge, setCurrentChallenge] = useState<string | null>(null);
+  const [pipPosition, setPipPosition] = useState({ x: 20, y: 20 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
 
   // --- REFS ---
   const videoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const monitoringRef = useRef<NodeJS.Timeout | null>(null);
-  const previousHashRef = useRef<Uint8Array | null>(null);
+  const peerConnection = useRef<RTCPeerConnection | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
   
   // Security Refs
   const sessionKeyRef = useRef<string | null>(null);
+  const webAuthnCredRef = useRef<string | null>(null);
   const anchorBiometricRef = useRef<any | null>(null);
-  const goldenAnchorRef = useRef<any | null>(null); // Anti-Drift Anchor
-  const cameraFingerprintRef = useRef<string | null>(null);
   const workerRef = useRef<Worker | null>(null);
-  
-  // Logic Refs
-  const stepRef = useRef(step); 
+  const monitoringRef = useRef<NodeJS.Timeout | null>(null);
   const trustScoreRef = useRef(trustScore); 
-  const challengeActiveRef = useRef(false);
-  const previousFramesRef = useRef<ImageData[]>([]);
-  const biometricFailuresRef = useRef(0);
   const landmarkerRef = useRef<FaceLandmarker | null>(null);
+  const challengeActiveRef = useRef(false);
+  
+  // Debounce
+  const noFaceCounter = useRef(0);
+  const lowBioCounter = useRef(0);
+  const lastSuccessTimeRef = useRef<number>(0);
 
-  // Sync Refs
-  useEffect(() => { stepRef.current = step; }, [step]);
   useEffect(() => { trustScoreRef.current = trustScore; }, [trustScore]);
 
-  // --- 1. INITIALIZE MEDIAPIPE ---
-  useEffect(() => {
-    const loadModel = async () => {
-      try {
-        const filesetResolver = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
-        );
-        landmarkerRef.current = await FaceLandmarker.createFromOptions(filesetResolver, {
-          baseOptions: {
-            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
-            delegate: "GPU"
-          },
-          outputFaceBlendshapes: true,
-          runningMode: "VIDEO",
-          numFaces: 1
-        });
-        console.log("MediaPipe Loaded");
-      } catch (err) {
-        console.error("Failed to load AI:", err);
-      }
-    };
-    loadModel();
-  }, []);
-
-  // --- CONFIG (HTTP for Localhost) ---
-  const getBackendUrl = () => {
-    if (typeof window === 'undefined') return 'http://localhost:8000';
-    return `http://${window.location.hostname}:8000`;
+  // --- PROXY HELPERS ---
+  const getBackendUrl = () => ""; 
+  const getWsUrl = () => {
+    if (typeof window !== 'undefined') {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        return `${protocol}//${window.location.host}/ws/${roomId}`;
+    }
+    return '';
   };
 
-  // --- WORKER INITIALIZATION ---
+  // --- 2. INITIALIZE ---
   useEffect(() => {
-    workerRef.current = new Worker('/biometric-worker.js');
-    
-    workerRef.current.onmessage = (e) => {
-      const { type, liveness, similarity, fingerprint } = e.data;
+    const loadModel = async () => {
+        try {
+            const filesetResolver = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm");
+            landmarkerRef.current = await FaceLandmarker.createFromOptions(filesetResolver, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numFaces: 1
+            });
+        } catch (e) {
+            console.warn("MediaPipe Load Error (Ignored)", e);
+        }
+    };
+    loadModel();
 
+    workerRef.current = new Worker('/biometric-worker.js');
+    workerRef.current.onmessage = (e) => {
+      const { type, similarity, liveness, fingerprint } = e.data;
       if (type === 'ANALYSIS_RESULT') {
-        if (typeof liveness === 'number') setLivenessScore(Math.round(liveness));
+        if (challengeActiveRef.current) return;
 
         if (typeof similarity === 'number' && anchorBiometricRef.current) {
-          if (similarity < 0.60) {
-            handleBiometricMismatchSmart(similarity);
+          if (similarity < 0.45) {
+             lowBioCounter.current += 1;
+             if (lowBioCounter.current > 3) handleSecurityEvent("Identity Mismatch", 10);
           } else {
-            setTrustScore(prev => Math.min(100, prev + 5)); 
-            biometricFailuresRef.current = 0; 
-            if (!challengeActiveRef.current && stepRef.current === 'monitoring') {
-                setStatusMessage('System Secure - Monitoring');
-            }
+             lowBioCounter.current = 0;
           }
         }
-      }
-      else if (type === 'ANCHOR_GENERATED') {
+      } else if (type === 'ANCHOR_GENERATED') {
         anchorBiometricRef.current = fingerprint;
-        goldenAnchorRef.current = fingerprint; 
-        setBiometricLocked(true);
-        console.log('[BIOMETRIC] Baseline & Golden Anchor set');
-      }
-      else if (type === 'ANCHOR_UPDATED') {
-        anchorBiometricRef.current = fingerprint;
-        console.log('[ADAPTIVE] Rolling anchor updated (Drift check passed)');
       }
     };
-
-    return () => {
-      cleanupResources();
-      workerRef.current?.terminate();
-    };
+    return () => cleanup();
   }, []);
 
-  const cleanupResources = () => {
-    if (streamRef.current) streamRef.current.getTracks().forEach(track => track.stop());
+  const handleSecurityEvent = (reason: string, penalty: number) => {
+      if (challengeActiveRef.current) return;
+      
+      if (Date.now() - lastSuccessTimeRef.current < 10000) {
+          setTrustScore(prev => Math.min(100, prev + 2)); 
+          setStatusMessage("Verifying... (Secure)");
+          return;
+      }
+
+      setTrustScore(prev => {
+          const newScore = Math.max(0, prev - penalty);
+          if (newScore < 40 && !challengeActiveRef.current) triggerLivenessChallenge();
+          return newScore;
+      });
+      setStatusMessage(`⚠️ ${reason}`);
+  };
+
+  const cleanup = () => {
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    if (socketRef.current) socketRef.current.close();
+    if (peerConnection.current) peerConnection.current.close();
     if (monitoringRef.current) clearInterval(monitoringRef.current);
   };
 
-  const arrayBufferToHex = (buffer: ArrayBuffer) => Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-  
-  const concatenateArrays = (arr1: Uint8Array, arr2: Uint8Array) => {
-    const result = new Uint8Array(arr1.length + arr2.length);
-    result.set(arr1, 0);
-    result.set(arr2, arr1.length);
-    return result;
-  };
-
-  const signPacket = async (sessionId: string, segmentId: number, hash: string, score: number) => {
-    if (!sessionKeyRef.current) return "unsigned"; 
-    const encoder = new TextEncoder();
-    const keyData = encoder.encode(sessionKeyRef.current);
-    // Signature includes Trust Score for server-side verification
-    const message = encoder.encode(`${sessionId}${segmentId}${hash}${score}`);
+  // --- 3. WEBAUTHN (SAFE WRAPPERS) ---
+  const registerSecurityKey = async () => {
     try {
-      const key = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-      const signature = await crypto.subtle.sign("HMAC", key, message);
-      return arrayBufferToHex(signature);
-    } catch (e) {
-      console.error("Signing failed:", e);
-      return "error";
+        setStatusMessage("Registering Key...");
+        const resp = await fetch(`${getBackendUrl()}/api/webauthn/register/options`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ email: userEmail })
+        });
+        const options = await resp.json();
+        
+        const attResp = await startRegistration(options);
+        
+        const verifyResp = await fetch(`${getBackendUrl()}/api/webauthn/register/verify`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ email: userEmail, response: attResp })
+        });
+        if (verifyResp.ok) setStatusMessage("Key Registered Successfully! ✅");
+        else setStatusMessage("Registration Failed ❌");
+
+    } catch (error: any) {
+        if (error.name === 'NotAllowedError') {
+            setStatusMessage("Registration Cancelled");
+        } else {
+            console.warn(error);
+            setStatusMessage("Registration Error");
+        }
     }
   };
 
-  const [livenessScore, setLivenessScore] = useState(0);
-  const [challengeActive, setChallengeActive] = useState(false);
-  const [currentChallenge, setCurrentChallenge] = useState<string | null>(null);
-
-  const handleBiometricMismatchSmart = async (similarity: number) => {
-    biometricFailuresRef.current++;
-    const penalty = similarity < 0.40 ? 20 : 5;
-    setTrustScore(prev => {
-        const newScore = Math.max(0, prev - penalty);
-        if (newScore === 0) { handleBiometricMismatch(similarity); return 0; } 
-        if (newScore < 60) {
-           setStatusMessage('⚠️ Analysing identity... Please hold still');
-           if (!challengeActiveRef.current) triggerLivenessChallenge();
+  const performWebAuthnLogin = async () => {
+    setStep('webauthn');
+    setStatusMessage('Please Touch Your Security Key...');
+    try {
+        const resp = await fetch(`${getBackendUrl()}/api/webauthn/login/options`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ email: userEmail })
+        });
+        if (!resp.ok) {
+            setStatusMessage("User not found. Register first!");
+            setTimeout(() => setStep('idle'), 2000);
+            return false;
         }
-        return newScore;
-    });
+        const options = await resp.json();
+        
+        const authResp = await startAuthentication(options);
+        
+        const verifyResp = await fetch(`${getBackendUrl()}/api/webauthn/login/verify`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ email: userEmail, response: authResp })
+        });
+        const verificationJSON = await verifyResp.json();
+        if (verificationJSON.verified) {
+            webAuthnCredRef.current = verificationJSON.credential_id;
+            setStatusMessage('Hardware Key Verified ✓');
+            return true;
+        }
+    } catch (error: any) {
+        if (error.name === 'NotAllowedError') {
+            setStatusMessage("Login Cancelled");
+            setTimeout(() => setStep('idle'), 1500);
+        } else {
+            setStatusMessage('Hardware Auth Failed');
+        }
+    }
+    return false;
   };
 
+  // --- 4. SIGNALING ---
+  const startCall = async (activeSessionId: string) => {
+    if (!streamRef.current) return;
+    setInCall(true);
+    socketRef.current = new WebSocket(getWsUrl());
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    streamRef.current.getTracks().forEach(track => pc.addTrack(track, streamRef.current!));
+    pc.ontrack = (event) => { if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0]; };
+    pc.onicecandidate = (event) => { if (event.candidate) socketRef.current?.send(JSON.stringify({ type: 'ice', candidate: event.candidate })); };
+    peerConnection.current = pc;
+    socketRef.current.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'identify') setRemoteSessionId(msg.sessionId);
+        if (msg.type === 'offer') {
+            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socketRef.current?.send(JSON.stringify({ type: 'answer', sdp: answer }));
+            socketRef.current?.send(JSON.stringify({ type: 'identify', sessionId: activeSessionId }));
+        } else if (msg.type === 'answer') await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        else if (msg.type === 'ice') await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+    };
+    socketRef.current.onopen = async () => {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socketRef.current?.send(JSON.stringify({ type: 'offer', sdp: offer }));
+        socketRef.current?.send(JSON.stringify({ type: 'identify', sessionId: activeSessionId }));
+    };
+  };
+
+  // --- 5. CHALLENGE (SAFE) ---
   const triggerLivenessChallenge = async () => {
     if (challengeActiveRef.current || !landmarkerRef.current) return;
     
+    challengeActiveRef.current = true;
+    setChallengeActive(true);
+    
     const challenges = [
-        { text: "Turn Head LEFT", check: (yaw: number) => yaw < -0.02 },
-        { text: "Turn Head RIGHT", check: (yaw: number) => yaw > 0.02 }
+        { text: "Turn Head LEFT ⬅️", check: (yaw: number) => yaw > 0.05 },
+        { text: "Turn Head RIGHT ➡️", check: (yaw: number) => yaw < -0.05 }
     ];
     const selected = challenges[Math.floor(Math.random() * challenges.length)];
-    
     setCurrentChallenge(selected.text);
-    setChallengeActive(true);
-    challengeActiveRef.current = true;
-    setStatusMessage('⚠️ SECURITY CHECK: Verify Liveness');
+    setStatusMessage('⚠️ SECURITY CHECK REQUIRED');
 
     const startTime = Date.now();
     let passed = false;
 
     while (Date.now() - startTime < 5000) {
-        if (videoRef.current && landmarkerRef.current) {
-            const now = performance.now();
-            const results = landmarkerRef.current.detectForVideo(videoRef.current, now);
-            if (results.faceLandmarks && results.faceLandmarks.length > 0) {
-                const landmarks = results.faceLandmarks[0];
-                const leftEarZ = landmarks[234].z;
-                const rightEarZ = landmarks[454].z;
-                const yaw = leftEarZ - rightEarZ;
-                if (selected.check(yaw)) { passed = true; break; }
-            }
+        if (videoRef.current && landmarkerRef.current && 
+            videoRef.current.readyState >= 2 && 
+            videoRef.current.videoWidth > 0 && 
+            videoRef.current.videoHeight > 0) {
+            try {
+                const results = landmarkerRef.current.detectForVideo(videoRef.current, performance.now());
+                if (results.faceLandmarks.length > 0) {
+                     const landmarks = results.faceLandmarks[0];
+                     const yaw = landmarks[234].z - landmarks[454].z;
+                     if (selected.check(yaw)) { passed = true; break; }
+                }
+            } catch (e) {}
         }
         await new Promise(r => setTimeout(r, 100));
     }
 
     if (passed) {
-        setTrustScore(prev => Math.min(100, prev + 25));
+        setTrustScore(100);
         setStatusMessage('Liveness Verified ✅');
-        await new Promise(r => setTimeout(r, 1000));
+        noFaceCounter.current = 0;
+        lowBioCounter.current = 0;
+        lastSuccessTimeRef.current = Date.now();
+        await new Promise(r => setTimeout(r, 1500));
     } else {
-        setTrustScore(prev => Math.max(0, prev - 40));
-        setStatusMessage('Liveness Failed ❌');
+        setTrustScore(0);
+        setStatusMessage('Authentication Failed ❌');
     }
+
     setChallengeActive(false);
     setCurrentChallenge(null);
     challengeActiveRef.current = false;
   };
 
-  const getCameraFingerprint = (stream: MediaStream): string => {
-    const videoTrack = stream.getVideoTracks()[0];
-    const settings = videoTrack.getSettings();
-    return JSON.stringify({
-      deviceId: settings.deviceId || 'unknown',
-      label: videoTrack.label,
-      width: settings.width,
-      frameRate: settings.frameRate
-    });
-  };
+  // --- 6. MONITORING (SAFE) ---
+  const startMonitoring = (activeSid: string) => {
+    let seg = 1;
+    monitoringRef.current = setInterval(async () => {
+        const video = videoRef.current;
+        const canvas = canvasRef.current;
+        if (!video || !canvas) return;
 
-  const performWebAuthn = async () => {
-    setStep('webauthn');
-    setStatusMessage('Authenticating with passkey...');
-    return true; 
+        const isReady = video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0;
+        
+        if (landmarkerRef.current && isReady) {
+            try {
+                const results = landmarkerRef.current.detectForVideo(video, performance.now());
+                if (results.faceLandmarks.length > 0) {
+                    setFaceDetected(true);
+                    noFaceCounter.current = 0; 
+                    if (!challengeActiveRef.current && trustScoreRef.current > 0) {
+                         setTrustScore(prev => Math.min(100, prev + 5));
+                         if (trustScoreRef.current > 90) setStatusMessage("Secured (PPAH Active)");
+                    }
+                } else {
+                    setFaceDetected(false);
+                    noFaceCounter.current += 1;
+                    if (noFaceCounter.current > 3 && !challengeActiveRef.current) {
+                        handleSecurityEvent("No Face Detected", 10);
+                    }
+                }
+            } catch (e) {}
+        }
+
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (ctx && isReady) {
+            ctx.drawImage(video, 0, 0);
+            const imgData = ctx.getImageData(0,0,640,480);
+            
+            if (seg === 1) workerRef.current?.postMessage({ type: 'GENERATE_ANCHOR', imageData: imgData });
+            else if (!challengeActiveRef.current) {
+                workerRef.current?.postMessage({ type: 'ANALYZE_FRAME', imageData: imgData, anchorBiometric: anchorBiometricRef.current });
+            }
+            
+            const hashBuf = await crypto.subtle.digest('SHA-256', imgData.data);
+            const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+            const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
+            
+            await fetch(`${getBackendUrl()}/api/verify-hash`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ session_id: activeSid, segment_id: seg, hash: hashHex, trust_score: trustScoreRef.current, signature: sig })
+            });
+            seg++;
+        }
+    }, 1000); 
   };
 
   const initializeCamera = async () => {
-    setStep('camera_check');
-    setStatusMessage('Checking camera...');
+    setStatusMessage('Initializing Camera...');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
-      });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
       streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await new Promise<void>((resolve) => {
-          if (videoRef.current) {
-            videoRef.current.onloadedmetadata = () => { videoRef.current?.play(); resolve(); };
-          }
-        });
-      }
-      cameraFingerprintRef.current = getCameraFingerprint(stream);
-      setStatusMessage('Physical camera verified ✓');
+      if (videoRef.current) videoRef.current.srcObject = stream;
       return true;
-    } catch (err: any) {
-      setError(`Camera access failed: ${err.message}`);
-      setStep('failed');
-      return false;
-    }
-  };
-
-  const captureAndHashFrames = async (numFrames = 10) => {
-    const hashes: Uint8Array[] = [];
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video) return [];
-    
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return [];
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-
-    for (let i = 0; i < numFrames; i++) {
-      ctx.drawImage(video, 0, 0);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const hashBuffer = await crypto.subtle.digest('SHA-256', imageData.data);
-      hashes.push(new Uint8Array(hashBuffer));
-      await new Promise(r => setTimeout(r, 50)); 
-    }
-    return hashes;
-  };
-
-  const createAnchorHash = async () => {
-    setStep('capturing');
-    setStatusMessage('Creating secure baseline...');
-    try {
-      const canvas = canvasRef.current;
-      const video = videoRef.current;
-      if (!canvas || !video) throw new Error("No video");
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx) throw new Error("No context");
-
-      const frameHashes = await captureAndHashFrames(10);
-      if (frameHashes.length === 0) throw new Error("No frames");
-      let combined = frameHashes[0];
-      for (let i = 1; i < frameHashes.length; i++) combined = concatenateArrays(combined, frameHashes[i]);
-      const anchorBuffer = await crypto.subtle.digest('SHA-256', combined);
-      
-      setAnchorHash(arrayBufferToHex(anchorBuffer));
-      previousHashRef.current = new Uint8Array(anchorBuffer);
-
-      ctx.drawImage(video, 0, 0);
-      const anchorImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      
-      workerRef.current?.postMessage({
-        type: 'GENERATE_ANCHOR',
-        imageData: anchorImageData
-      });
-
-      const backendUrl = getBackendUrl();
-      const initRes = await fetch(`${backendUrl}/api/session/init`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            email: "demo@ppah.app", 
-            camera_fingerprint: cameraFingerprintRef.current 
-          })
-      });
-      const initData = await initRes.json();
-      setSessionId(initData.session_id);
-      
-      if (initData.session_key) {
-        sessionKeyRef.current = initData.session_key;
-        console.log("Session Key Exchange Complete");
-      }
-
-      setStatusMessage('Baseline Established');
-      setStep('monitoring');
-      setTrustScore(100);
-      startMonitoring(initData.session_id);
-
-    } catch (err: any) {
-      console.error(err);
-      setError('Failed to create baseline');
-      setStep('failed');
-    }
-  };
-
-  const startMonitoring = (activeSessionId: string) => {
-    let segmentCounter = 1;
-
-    monitoringRef.current = setInterval(async () => {
-      try {
-        if (!previousHashRef.current || !videoRef.current || !canvasRef.current) return;
-        
-        const frameHashes = await captureAndHashFrames(5);
-        if (frameHashes.length === 0) return;
-
-        const ctx = canvasRef.current.getContext('2d', { willReadFrequently: true });
-        if (ctx) {
-            ctx.drawImage(videoRef.current, 0, 0);
-            const imageData = ctx.getImageData(0, 0, canvasRef.current.width, canvasRef.current.height);
-            previousFramesRef.current.push(imageData);
-            if (previousFramesRef.current.length > 5) previousFramesRef.current.shift();
-
-            workerRef.current?.postMessage({
-                type: 'ANALYZE_FRAME',
-                imageData: imageData,
-                previousFrames: previousFramesRef.current, 
-                anchorBiometric: anchorBiometricRef.current,
-                goldenAnchor: goldenAnchorRef.current 
-            });
-        }
-
-        let combined = frameHashes[0];
-        for (let i = 1; i < frameHashes.length; i++) combined = concatenateArrays(combined, frameHashes[i]);
-        const chainedData = concatenateArrays(combined, previousHashRef.current);
-        const currentHashBuffer = await crypto.subtle.digest('SHA-256', chainedData);
-        const currentHashHex = arrayBufferToHex(currentHashBuffer);
-
-        const segmentToSend = segmentCounter;
-        
-        const currentScore = trustScoreRef.current; 
-        const signature = await signPacket(activeSessionId, segmentToSend, currentHashHex, currentScore);
-
-        const backendUrl = getBackendUrl();
-        const response = await fetch(`${backendUrl}/api/verify-hash`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            session_id: activeSessionId,
-            segment_id: segmentToSend,
-            hash: currentHashHex,
-            trust_score: currentScore,
-            signature: signature 
-          })
-        }).catch(e => null);
-
-        if (response && response.ok) {
-          const data = await response.json();
-          if (!data.valid) handleHashMismatch();
-          else {
-            previousHashRef.current = new Uint8Array(currentHashBuffer);
-            setSegmentCount(segmentCounter);
-            segmentCounter++;
-          }
-        }
-      } catch (err) { console.error('Monitoring error:', err); }
-    }, 2000);
-  };
-
-  const handleHashMismatch = () => {
-    cleanupResources();
-    setStep('frozen');
-    setStatusMessage('⚠️ SECURITY ALERT: Integrity Broken');
-    setError('Hash chain validation failed. Server rejected packet.');
-  };
-
-  const handleBiometricMismatch = (similarity: number) => {
-    cleanupResources();
-    setStep('frozen');
-    setStatusMessage('⚠️ SECURITY ALERT: Biometric Mismatch');
-    setError(`Person changed! Trust score depleted.`);
+    } catch (e) { return false; }
   };
 
   const startVerification = async () => {
-    setError(null);
-    setBiometricLocked(false);
-    await performWebAuthn(); 
-    await new Promise(r => setTimeout(r, 500));
+    if (!roomId.trim()) {
+      setStatusMessage('❌ Please enter a room name');
+      return;
+    }
+    
+    const authSuccess = await performWebAuthnLogin();
+    if (!authSuccess) return;
+
+    // STEP = INITIALIZING (Local Video becomes BIG)
+    setStep('initializing');
     const cam = await initializeCamera();
     if (cam) {
-        await new Promise(r => setTimeout(r, 500));
-        await createAnchorHash();
+        const res = await fetch(`${getBackendUrl()}/api/session/init`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ email: userEmail, webauthn_credential_id: webAuthnCredRef.current })
+        });
+        const data = await res.json();
+        setSessionId(data.session_id);
+        sessionKeyRef.current = data.session_key;
+        
+        startMonitoring(data.session_id);
+        await startCall(data.session_id);
+        
+        // STEP = ACTIVE (Local Video shrinks to PIP, Remote Video becomes BIG)
+        setStep('active');
+        setStatusMessage('Secure Call Active');
     }
   };
 
-  const stopVerification = () => {
-    cleanupResources();
-    setStep('idle');
-    setStatusMessage('Ready');
-    setSessionId(null);
-    setSegmentCount(0);
-    setTrustScore(100);
-    setBiometricLocked(false);
-    sessionKeyRef.current = null; 
+  const signPacket = async (sid: string, segId: number, hash: string, score: number) => {
+    if (!sessionKeyRef.current) return "error";
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey("raw", enc.encode(sessionKeyRef.current), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const sig = await crypto.subtle.sign("HMAC", key, enc.encode(`${sid}${segId}${hash}${score}`));
+    return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
   };
+
+  // --- DRAGGING HANDLERS ---
+  const handleMouseDown = (e: React.MouseEvent) => {
+    // Only allow drag if in PIP mode (step === 'active')
+    if (step !== 'active') return; 
+
+    setIsDragging(true);
+    setDragOffset({
+      x: e.clientX - pipPosition.x,
+      y: e.clientY - pipPosition.y
+    });
+  };
+
+  const handleMouseMove = (e: MouseEvent) => {
+    if (isDragging) {
+      setPipPosition({
+        x: e.clientX - dragOffset.x,
+        y: e.clientY - dragOffset.y
+      });
+    }
+  };
+
+  const handleMouseUp = () => {
+    setIsDragging(false);
+  };
+
+  useEffect(() => {
+    if (isDragging) {
+      window.addEventListener('mousemove', handleMouseMove);
+      window.addEventListener('mouseup', handleMouseUp);
+      return () => {
+        window.removeEventListener('mousemove', handleMouseMove);
+        window.removeEventListener('mouseup', handleMouseUp);
+      };
+    }
+  }, [isDragging, dragOffset]);
+
+  useEffect(() => {
+    if (!remoteSessionId) return;
+    const interval = setInterval(async () => {
+        try {
+            const res = await fetch(`${getBackendUrl()}/api/session/${remoteSessionId}/security-report`);
+            if (res.ok) {
+                const data = await res.json();
+                setRemoteTrustScore(data.status === 'active' ? 100 : 0);
+            }
+        } catch (e) {}
+    }, 2000); 
+    return () => clearInterval(interval);
+  }, [remoteSessionId]);
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-200 p-8 font-sans">
-      <div className="max-w-4xl mx-auto bg-slate-800 rounded-2xl shadow-2xl overflow-hidden border border-slate-700">
-        <div className="bg-slate-950 p-6 border-b border-slate-700">
-          <div className="flex items-center gap-3">
-            <Shield className="w-8 h-8 text-blue-500" />
-            <div>
-              <h1 className="text-2xl font-bold text-white">PPAH 3.0 Enterprise</h1>
-              <p className="text-xs text-slate-400 mt-1">Multi-Modal: Hash Chain + Biometric Lock + Packet Signing</p>
-            </div>
-          </div>
-        </div>
-
-        <div className="relative bg-black h-[400px] flex items-center justify-center">
-          <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover transform scale-x-[-1]" />
-          
-          <div className="absolute top-4 left-4 right-4 flex justify-between items-start">
-             <div className={`backdrop-blur px-4 py-2 rounded-full text-white text-sm flex items-center gap-2 border border-white/10 ${step === 'frozen' ? 'bg-red-600/80' : 'bg-black/60'}`}>
-                {step === 'monitoring' ? <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" /> : <Lock size={14} />}
-                {statusMessage}
-             </div>
-             {sessionId && <div className="bg-black/60 backdrop-blur px-3 py-1 rounded text-xs text-slate-400 font-mono border border-white/10">ID: {sessionId.substring(0, 8)}</div>}
-          </div>
-
-          {challengeActive && currentChallenge && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/70 backdrop-blur z-20">
-              <div className="bg-blue-600/90 p-8 rounded-2xl shadow-2xl text-center animate-pulse border border-blue-400">
-                <div className="text-4xl mb-4">👤</div>
-                <div className="text-2xl font-bold text-white mb-2">Liveness Check</div>
-                <div className="text-xl text-white">{currentChallenge}</div>
-              </div>
-            </div>
-          )}
-
-          {livenessScore > 0 && step === 'monitoring' && (
-            <div className="absolute bottom-4 right-4 bg-black/70 backdrop-blur px-3 py-2 rounded-lg text-xs">
-              <div className="text-slate-400 mb-1">Motion Detect</div>
-              <div className="flex items-center gap-2">
-                <div className="w-24 h-2 bg-slate-700 rounded-full overflow-hidden">
-                  <div className={`h-full transition-all ${livenessScore > 70 ? 'bg-green-500' : 'bg-yellow-500'}`} style={{ width: `${livenessScore}%` }} />
+      <div className="max-w-6xl mx-auto">
+        <header className="mb-6 flex justify-between items-center">
+            <h1 className="text-2xl font-bold text-white flex gap-2 items-center"><Shield className="text-blue-500"/> PPAH Remote</h1>
+            {step === 'idle' && (
+                <div className="flex gap-4 items-center">
+                     <button onClick={registerSecurityKey} className="text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded flex items-center gap-1">
+                        <PlusCircle size={14} /> Register Key
+                     </button>
+                     <input 
+                        value={tempRoomId} 
+                        onChange={(e) => setTempRoomId(e.target.value)} 
+                        onKeyPress={(e) => e.key === 'Enter' && setRoomId(tempRoomId)}
+                        className="bg-slate-800 p-2 rounded text-sm border border-slate-600 focus:border-blue-500 outline-none" 
+                        placeholder="Enter room name (e.g., uk-meeting)"
+                     />
+                     <button 
+                        onClick={() => setRoomId(tempRoomId)}
+                        className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded text-sm font-semibold"
+                     >
+                        Join Room
+                     </button>
                 </div>
-                <span className="font-mono font-bold text-white">{livenessScore}</span>
-              </div>
-            </div>
-          )}
-
-          {step === 'monitoring' && (
-            <div className="absolute bottom-4 left-4 bg-black/70 backdrop-blur px-3 py-2 rounded-lg text-xs">
-              <div className="text-slate-400 mb-1">Identity Trust</div>
-              <div className="flex items-center gap-2">
-                <div className="w-24 h-2 bg-slate-700 rounded-full overflow-hidden">
-                  <div className={`h-full transition-all duration-500 ${trustScore > 60 ? 'bg-blue-500' : trustScore > 20 ? 'bg-orange-500' : 'bg-red-500'}`} style={{ width: `${trustScore}%` }} />
+            )}
+            {step !== 'idle' && roomId && (
+                <div className="bg-slate-800 px-4 py-2 rounded border border-blue-500/50">
+                    <span className="text-xs text-slate-400">Room: </span>
+                    <span className="font-mono text-blue-400 font-bold">{roomId}</span>
                 </div>
-                <span className="font-mono font-bold text-white">{trustScore}%</span>
-              </div>
+            )}
+        </header>
+
+        {step === 'webauthn' && (
+            <div className="fixed inset-0 bg-black/90 z-50 flex flex-col items-center justify-center">
+                <div className="bg-slate-800 p-8 rounded-2xl flex flex-col items-center animate-pulse border border-blue-500">
+                    <Fingerprint className="w-16 h-16 text-blue-500 mb-4" />
+                    <h2 className="text-xl font-bold text-white mb-2">Hardware Authentication</h2>
+                    <p className="text-slate-400">Please touch your security key...</p>
+                </div>
             </div>
-          )}
+        )}
+
+        <div className="relative">
+            {/* REMOTE VIDEO - BACKGROUND LAYER */}
+            {/* Only shown when in active call */}
+            <div className={`bg-slate-800 rounded-2xl overflow-hidden shadow-xl border border-slate-700 relative h-[600px] transition-all duration-500 z-0`}>
+                <div className="absolute top-4 left-4 z-10 bg-black/70 backdrop-blur px-3 py-1 rounded text-xs text-white font-semibold">
+                    {remoteSessionId ? 'REMOTE USER' : 'WAITING FOR CONNECTION...'}
+                </div>
+                
+                {/* IDLE UI when no call is active */}
+                {!inCall && step !== 'active' && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400 bg-slate-900">
+                        <Phone size={48} className="mb-4 opacity-50" />
+                        <p>{step === 'initializing' ? 'Initializing Camera...' : 'Waiting for connection...'}</p>
+                        {roomId && <p className="text-xs mt-2 font-mono text-blue-400">Room: {roomId}</p>}
+                    </div>
+                )}
+
+                <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover bg-black" />
+                
+                {/* Remote Trust Score Overlay */}
+                <div className="absolute bottom-4 left-4 right-4 z-10">
+                    <div className="bg-black/70 backdrop-blur p-3 rounded-lg">
+                        <div className="flex justify-between items-center mb-2">
+                            <span className="text-xs uppercase text-slate-300">Remote Verification</span>
+                            {remoteTrustScore !== null ? (
+                                <span className={`font-mono font-bold flex gap-2 items-center ${remoteTrustScore > 80 ? 'text-green-400' : 'text-red-400'}`}>
+                                    {remoteTrustScore > 80 ? <Shield size={14}/> : <AlertTriangle size={14}/>}
+                                    {remoteTrustScore}%
+                                </span>
+                            ) : <span className="text-slate-400 text-xs">CONNECTING...</span>}
+                        </div>
+                        <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+                            <div className={`h-full transition-all ${remoteTrustScore && remoteTrustScore > 80 ? 'bg-blue-500' : 'bg-red-500'}`} 
+                                style={{width: `${remoteTrustScore || 0}%`}} />
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* YOUR VIDEO - DYNAMIC LAYOUT */}
+            {/* If 'initializing': Show BIG (Fullscreen overlay) */}
+            {/* If 'active': Show SMALL (PIP, Draggable) */}
+            {(step === 'active' || step === 'initializing') && (
+                <div 
+                    className={
+                        step === 'initializing' 
+                        ? "fixed inset-0 z-50 bg-slate-900 flex items-center justify-center" // Fullscreen mode
+                        : "absolute z-20 bg-slate-800 rounded-xl overflow-hidden shadow-2xl border-2 border-slate-600 cursor-move select-none" // PIP mode
+                    }
+                    style={step === 'active' ? {
+                        left: `${pipPosition.x}px`,
+                        top: `${pipPosition.y}px`,
+                        width: '240px',
+                        height: '320px'
+                    } : {}} // No style overrides when fullscreen
+                    onMouseDown={handleMouseDown}
+                >
+                    <div className="absolute top-2 left-2 z-30 bg-black/70 backdrop-blur px-2 py-1 rounded text-xs text-white font-semibold">
+                        YOU
+                    </div>
+                    {/* Move Icon only visible in PIP */}
+                    {step === 'active' && (
+                        <div className="absolute top-2 right-2 z-30 bg-black/50 p-1 rounded-full">
+                            <Move size={12} className="text-white" />
+                        </div>
+                    )}
+
+                    <div className="relative h-full w-full">
+                        <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover transform scale-x-[-1] bg-black" />
+                        
+                        {/* Challenge Overlay */}
+                        {challengeActive && currentChallenge && (
+                            <div className="absolute inset-0 bg-black/90 backdrop-blur z-20 flex flex-col items-center justify-center">
+                                <div className="text-3xl mb-2">👮</div>
+                                <h3 className="text-sm font-bold text-white mb-1">Security Check</h3>
+                                <div className="text-sm text-yellow-400 font-mono font-bold bg-slate-900 px-3 py-1 rounded border border-yellow-500/50">
+                                    {currentChallenge}
+                                </div>
+                            </div>
+                        )}
+                        
+                        {/* Face Not Detected Warning */}
+                        {!faceDetected && !challengeActive && step === 'active' && (
+                            <div className="absolute inset-0 flex items-center justify-center pointer-events-none bg-red-900/50">
+                                <div className="bg-red-600 text-white px-2 py-1 rounded text-xs font-bold flex gap-1 items-center">
+                                    <UserX size={12} /> NO FACE
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                    
+                    {/* Your Trust Score (Bottom Bar) */}
+                    <div className="absolute bottom-0 left-0 right-0 bg-black/80 backdrop-blur p-2">
+                        <div className="flex justify-between items-center mb-1">
+                            <span className="text-xs text-slate-300">Trust</span>
+                            <span className={`font-mono text-xs font-bold ${trustScore > 80 ? 'text-green-400' : 'text-red-400'}`}>
+                                {trustScore}%
+                            </span>
+                        </div>
+                        <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                            <div 
+                                className={`h-full transition-all duration-300 ${trustScore > 80 ? 'bg-green-500' : 'bg-red-500'}`} 
+                                style={{width: `${trustScore}%`}} 
+                            />
+                        </div>
+                        <div className="text-xs text-slate-400 mt-1 text-center truncate">{statusMessage}</div>
+                    </div>
+                </div>
+            )}
         </div>
+        
+        <canvas ref={canvasRef} width={640} height={480} className="hidden" />
 
-        <canvas ref={canvasRef} className="hidden" />
-
-        <div className="p-6 space-y-6">
-          {error && (
-            <div className="bg-red-500/10 border border-red-500/50 text-red-200 p-4 rounded-lg flex items-center gap-3">
-              <AlertTriangle className="flex-shrink-0 text-red-500" />
-              <div><p className="font-bold text-red-400">Security Alert</p><p className="text-sm">{error}</p></div>
-            </div>
-          )}
-
-          <div className="flex gap-4">
-             {step === 'idle' || step === 'failed' || step === 'frozen' ? (
-                <button onClick={startVerification} className="flex-1 bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 rounded-lg flex items-center justify-center gap-2">
-                   <Shield size={20} /> Initialize Secure Session
+        <div className="mt-8 flex justify-center">
+            {step === 'idle' ? (
+                <button 
+                    onClick={startVerification} 
+                    disabled={!roomId.trim()}
+                    className={`${roomId.trim() ? 'bg-blue-600 hover:bg-blue-500' : 'bg-slate-600 cursor-not-allowed'} text-white px-8 py-3 rounded-full font-bold flex items-center gap-2 transition-all`}
+                >
+                    <Phone size={20} /> Start Secure Video Call
                 </button>
-             ) : (
-                <button onClick={stopVerification} className="flex-1 bg-slate-600 hover:bg-slate-500 text-white font-bold py-4 rounded-lg">Terminate</button>
-             )}
-          </div>
-
-          <div className="grid grid-cols-4 gap-4 text-center">
-            <div className="bg-slate-700/50 p-3 rounded border border-slate-600">
-               <div className="text-slate-400 text-[10px] uppercase">Segments</div>
-               <div className="text-xl font-mono text-blue-400 font-bold">{segmentCount}</div>
-            </div>
-            <div className="bg-slate-700/50 p-3 rounded border border-slate-600">
-               <div className="text-slate-400 text-[10px] uppercase">Biometric</div>
-               <div className={`text-sm font-bold ${biometricLocked ? 'text-green-400' : 'text-slate-400'}`}>{biometricLocked ? 'LOCKED' : '-'}</div>
-            </div>
-            <div className="bg-slate-700/50 p-3 rounded border border-slate-600">
-               <div className="text-slate-400 text-[10px] uppercase">Integrity</div>
-               <div className={`text-sm font-bold ${sessionKeyRef.current ? 'text-green-400' : 'text-slate-400'}`}>{sessionKeyRef.current ? 'HMAC-256' : 'NONE'}</div>
-            </div>
-            <div className="bg-slate-700/50 p-3 rounded border border-slate-600">
-               <div className="text-slate-400 text-[10px] uppercase">Status</div>
-               <div className={`text-sm font-bold ${step === 'monitoring' ? 'text-green-400' : step === 'frozen' ? 'text-red-400' : 'text-slate-400'}`}>
-                  {step === 'monitoring' ? 'SECURE' : step === 'frozen' ? 'BREACH' : 'IDLE'}
-               </div>
-            </div>
-          </div>
+            ) : (
+                <button onClick={() => window.location.reload()} className="bg-red-600 hover:bg-red-500 text-white px-8 py-3 rounded-full font-bold flex items-center gap-2 z-50 relative">
+                    <PhoneOff size={20} /> End Call
+                </button>
+            )}
         </div>
       </div>
     </div>

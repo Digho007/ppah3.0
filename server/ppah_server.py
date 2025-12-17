@@ -1,8 +1,8 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Body
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-from typing import Dict, Optional, List
-from datetime import datetime, timedelta
+from pydantic import BaseModel
+from typing import Dict, Optional, List, Any
+from datetime import datetime
 import hashlib
 import hmac
 import secrets
@@ -10,11 +10,46 @@ import json
 import sqlite3
 import os
 
+# --- WEBAUTHN IMPORTS ---
+from webauthn import (
+    generate_registration_options,
+    verify_registration_response,
+    options_to_json,
+    generate_authentication_options,
+    verify_authentication_response,
+)
+from webauthn.helpers import (
+    parse_registration_credential_json,
+    parse_authentication_credential_json
+)
+from webauthn.helpers.structs import (
+    AuthenticatorSelectionCriteria,
+    UserVerificationRequirement,
+    PublicKeyCredentialCreationOptions,
+    PublicKeyCredentialRequestOptions,
+    PublicKeyCredentialDescriptor,
+    PublicKeyCredentialType,
+)
+
 app = FastAPI(title="PPAH Enhanced Verification API")
+
+# --- CONFIGURATION ---
+NGROK_DOMAIN = "jim-peaceable-inconsequently.ngrok-free.dev"
+
+if NGROK_DOMAIN:
+    RP_ID = NGROK_DOMAIN
+    RP_NAME = "PPAH Remote"
+    ORIGIN = f"https://{NGROK_DOMAIN}"
+    ALLOW_ORIGINS = [ORIGIN, "http://localhost:3000"]
+else:
+    RP_ID = "localhost"
+    RP_NAME = "PPAH Local"
+    ORIGIN = "http://localhost:3000"
+    ALLOW_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=ALLOW_ORIGINS, 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -22,286 +57,284 @@ app.add_middleware(
 
 DB_NAME = "ppah_enterprise.db"
 
+# --- 1. SIGNALING MANAGER (WITH ROOM LOCK) ---
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, room_id: str):
+        await websocket.accept()
+        
+        if room_id not in self.active_connections:
+            self.active_connections[room_id] = []
+        
+        # --- THE FIX: BOUNCER LOGIC ---
+        # If 2 or more people are already in the room, KICK the new person.
+        if len(self.active_connections[room_id]) >= 2:
+            print(f"Refused connection to {room_id}: Room Full")
+            await websocket.send_json({"type": "error", "message": "ROOM_FULL"})
+            await websocket.close(code=1008) # 1008 = Policy Violation
+            return False # Connection Failed
+
+        self.active_connections[room_id].append(websocket)
+        print(f"User joined {room_id}. Total: {len(self.active_connections[room_id])}")
+        return True # Connection Success
+
+    def disconnect(self, websocket: WebSocket, room_id: str):
+        if room_id in self.active_connections:
+            if websocket in self.active_connections[room_id]:
+                self.active_connections[room_id].remove(websocket)
+                print(f"User left {room_id}. Remaining: {len(self.active_connections[room_id])}")
+            if not self.active_connections[room_id]:
+                del self.active_connections[room_id]
+
+    async def broadcast(self, message: dict, room_id: str, sender: WebSocket):
+        if room_id in self.active_connections:
+            for connection in self.active_connections[room_id]:
+                if connection != sender:
+                    await connection.send_json(message)
+
+manager = ConnectionManager()
+
+# --- 2. DATABASE ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS sessions 
-                 (session_id TEXT PRIMARY KEY, 
-                  data TEXT, 
-                  updated_at TIMESTAMP)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS magic_links 
-                 (token TEXT PRIMARY KEY, 
-                  data TEXT, 
-                  expires_at TIMESTAMP)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS credentials 
-                 (cred_id TEXT PRIMARY KEY, 
-                  data TEXT)''')
+                 (session_id TEXT PRIMARY KEY, data TEXT, updated_at TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS credentials
+                 (id BLOB PRIMARY KEY, 
+                  user_email TEXT, 
+                  public_key BLOB, 
+                  sign_count INTEGER)''')
     conn.commit()
     conn.close()
 
 init_db()
 
+# --- 3. WEBAUTHN ENDPOINTS ---
+challenge_store = {} 
+
+class WebAuthnResponse(BaseModel):
+    email: str
+    response: Dict[str, Any]
+
+@app.post("/api/webauthn/register/options")
+async def register_options(data: dict = Body(...)):
+    email = data.get("email")
+    user_id_bytes = hashlib.sha256(email.encode()).digest()
+    
+    options = generate_registration_options(
+        rp_id=RP_ID,
+        rp_name=RP_NAME,
+        user_id=user_id_bytes,
+        user_name=email,
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            user_verification=UserVerificationRequirement.PREFERRED
+        )
+    )
+    challenge_store[email] = options.challenge
+    return json.loads(options_to_json(options))
+
+@app.post("/api/webauthn/register/verify")
+async def register_verify(data: WebAuthnResponse):
+    try:
+        email = data.email
+        challenge = challenge_store.get(email)
+        credential = parse_registration_credential_json(data.response)
+
+        verification = verify_registration_response(
+            credential=credential,
+            expected_challenge=challenge,
+            expected_origin=ORIGIN,
+            expected_rp_id=RP_ID,
+        )
+        
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO credentials (id, user_email, public_key, sign_count) VALUES (?, ?, ?, ?)",
+                  (verification.credential_id, email, verification.credential_public_key, verification.sign_count))
+        conn.commit()
+        conn.close()
+        return {"verified": True}
+    except Exception as e:
+        print(f"Register Error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/webauthn/login/options")
+async def login_options(data: dict = Body(...)):
+    email = data.get("email")
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT id FROM credentials WHERE user_email = ?", (email,))
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail="User not registered")
+
+    allow_credentials_list = []
+    for row in rows:
+        allow_credentials_list.append(
+            PublicKeyCredentialDescriptor(
+                id=row[0], 
+                type=PublicKeyCredentialType.PUBLIC_KEY
+            )
+        )
+
+    options = generate_authentication_options(
+        rp_id=RP_ID,
+        allow_credentials=allow_credentials_list,
+        user_verification=UserVerificationRequirement.PREFERRED,
+    )
+    challenge_store[email] = options.challenge
+    return json.loads(options_to_json(options))
+
+@app.post("/api/webauthn/login/verify")
+async def login_verify(data: WebAuthnResponse):
+    try:
+        email = data.email
+        challenge = challenge_store.get(email)
+        credential = parse_authentication_credential_json(data.response)
+
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT public_key, sign_count FROM credentials WHERE id = ?", (credential.raw_id,))
+        row = c.fetchone()
+        conn.close()
+        
+        if not row: raise HTTPException(status_code=400, detail="Credential not found")
+
+        verification = verify_authentication_response(
+            credential=credential,
+            expected_challenge=challenge,
+            expected_origin=ORIGIN,
+            expected_rp_id=RP_ID,
+            credential_public_key=row[0],
+            credential_current_sign_count=row[1],
+        )
+        
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("UPDATE credentials SET sign_count = ? WHERE id = ?", (verification.new_sign_count, credential.raw_id))
+        conn.commit()
+        conn.close()
+        
+        return {"verified": True, "credential_id": credential.id}
+    except Exception as e:
+        print(f"Login Error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- 4. PPAH SESSION LOGIC ---
 class InitSessionRequest(BaseModel):
-    email: Optional[EmailStr] = None
-    webauthn_credential_id: Optional[str] = None
+    email: str
+    webauthn_credential_id: str
     camera_fingerprint: Optional[str] = None
 
 class VerifyHashRequest(BaseModel):
     session_id: str
     segment_id: int
     hash: str
-    trust_score: int # <--- NEW: Server receives the score
+    trust_score: int 
     signature: str 
 
-class ReAuthRequest(BaseModel):
-    session_id: str
-    webauthn_credential_id: str
-
-class MagicLinkRequest(BaseModel):
-    email: EmailStr
-
-SESSION_TIMEOUT = 3600
-
 class PPAHSession:
-    def __init__(self, session_id: str, email: Optional[str] = None, 
-                 camera_fingerprint: Optional[str] = None,
-                 session_key: str = None,
-                 restore_data: dict = None):
-        
-        if restore_data:
-            self.session_id = restore_data['session_id']
-            self.email = restore_data['email']
-            self.created_at = datetime.fromisoformat(restore_data['created_at'])
-            self.last_activity = datetime.fromisoformat(restore_data['last_activity'])
-            self.status = restore_data['status']
-            self.segment_count = restore_data['segment_count']
-            self.hash_chain = restore_data['hash_chain']
-            self.freeze_reason = restore_data['freeze_reason']
-            self.session_key = restore_data['session_key']
-            self.camera_fingerprint = restore_data['camera_fingerprint']
-            self.camera_fingerprint_locked = restore_data['camera_locked']
-            self.anomaly_log = restore_data['anomaly_log']
-        else:
-            self.session_id = session_id
-            self.email = email
-            self.created_at = datetime.now()
-            self.last_activity = datetime.now()
-            self.status = "active"
-            self.segment_count = 0
-            self.hash_chain = []
-            self.freeze_reason = None
-            self.session_key = session_key 
-            self.camera_fingerprint = camera_fingerprint
-            self.camera_fingerprint_locked = camera_fingerprint is not None
-            self.anomaly_log = []
-        
+    def __init__(self, session_id: str, email: str, webauthn_id: str, session_key: str):
+        self.session_id = session_id
+        self.email = email
+        self.webauthn_id = webauthn_id
+        self.session_key = session_key
+        self.created_at = datetime.now()
+        self.status = "active"
+        self.segment_count = 0
+        self.hash_chain = []
+        self.freeze_reason = None
+
     def verify_signature(self, segment_id: int, hash_value: str, trust_score: int, signature: str) -> bool:
-        if not self.session_key:
-            self.log_anomaly("Missing session key for signature verification")
-            return False 
-        
-        # RECONSTRUCT MESSAGE: Must match client encoding exactly
-        # Message = SessionID + SegmentID + Hash + TrustScore
         message = f"{self.session_id}{segment_id}{hash_value}{trust_score}"
-        
         try:
-            expected_sig = hmac.new(
-                self.session_key.encode('utf-8'),
-                message.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-        except Exception:
-            return False
-        return hmac.compare_digest(expected_sig, signature)
+            expected_sig = hmac.new(self.session_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256).hexdigest()
+            return hmac.compare_digest(expected_sig, signature)
+        except: return False
 
-    def add_hash(self, segment_id: int, hash_value: str, trust_score: int, signature: str) -> bool:
-        self.last_activity = datetime.now()
-        
-        # 1. Signature Check (Includes Trust Score)
+    def add_hash(self, segment_id: int, hash_value: str, trust_score: int, signature: str):
         if not self.verify_signature(segment_id, hash_value, trust_score, signature):
-            self.log_anomaly(f"Invalid HMAC signature for segment {segment_id}")
-            self.freeze("Packet signature verification failed - Possible spoofing")
+            self.status = "frozen"
+            self.freeze_reason = "Signature Failed"
             return False
-
-        # 2. SERVER AUTHORITY CHECK (Mitigation 1)
         if trust_score < 40:
-            self.log_anomaly(f"Trust score dropped below threshold: {trust_score}")
-            self.freeze("Biometric Trust Score Failed")
+            self.status = "frozen"
+            self.freeze_reason = f"Low Trust Score: {trust_score}"
             return False
-
-        # 3. Sliding Window
-        expected = self.segment_count + 1
-        if segment_id == expected:
-            pass
-        elif segment_id == expected + 1:
-            self.log_anomaly(f"Packet loss detected (Gap: {expected} missing)")
-        elif segment_id <= self.segment_count:
-            return True
-        else:
-            self.log_anomaly(f"Non-sequential segment: expected {expected}, got {segment_id}")
-            self.freeze(f"Segment sequence break detected (Gap > 1)")
-            return False
-        
-        self.hash_chain.append({
-            'segment_id': segment_id,
-            'hash': hash_value,
-            'trust_score': trust_score,
-            'timestamp': datetime.now().isoformat()
-        })
+        self.hash_chain.append({'hash': hash_value, 'timestamp': datetime.now().isoformat()})
         self.segment_count = segment_id
         return True
-    
-    def log_anomaly(self, description: str):
-        self.anomaly_log.append({
-            'timestamp': datetime.now().isoformat(),
-            'description': description,
-            'segment_count': self.segment_count
-        })
-        print(f"[ANOMALY] {self.session_id[:8]} - {description}")
-    
-    def freeze(self, reason: str):
-        self.status = "frozen"
-        self.freeze_reason = reason
-        print(f"[SECURITY] Session {self.session_id[:8]} frozen: {reason}")
-    
-    def is_active(self) -> bool:
-        if self.status != "active": return False
-        if (datetime.now() - self.last_activity).total_seconds() > SESSION_TIMEOUT:
-            self.status = "terminated"
-            return False
-        return True
-    
-    def to_dict(self) -> dict:
-        return {
-            'session_id': self.session_id,
-            'email': self.email,
-            'created_at': self.created_at.isoformat(),
-            'last_activity': self.last_activity.isoformat(),
-            'status': self.status,
-            'segment_count': self.segment_count,
-            'hash_chain': self.hash_chain,
-            'freeze_reason': self.freeze_reason,
-            'session_key': self.session_key,
-            'camera_fingerprint': self.camera_fingerprint,
-            'camera_locked': self.camera_fingerprint_locked,
-            'anomaly_log': self.anomaly_log
-        }
-    
-    def get_security_report(self) -> dict:
-        return {
-            'session_id': self.session_id,
-            'duration_seconds': (datetime.now() - self.created_at).total_seconds(),
-            'total_segments': self.segment_count,
-            'status': self.status,
-            'freeze_reason': self.freeze_reason,
-            'anomalies': self.anomaly_log,
-            'security_layers': {
-                'hash_chain': True,
-                'packet_signing': True,
-                'camera_fingerprint': self.camera_fingerprint_locked,
-                'persistence': 'SQLite',
-                'server_authority': True
-            }
-        }
+
+    def to_dict(self):
+        return self.__dict__.copy()
 
 def save_session(session: PPAHSession):
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute('INSERT OR REPLACE INTO sessions (session_id, data, updated_at) VALUES (?, ?, ?)',
-                  (session.session_id, json.dumps(session.to_dict()), datetime.now()))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"[DB ERROR] Save failed: {e}")
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    data = session.to_dict()
+    data['created_at'] = str(data['created_at'])
+    c.execute('INSERT OR REPLACE INTO sessions (session_id, data, updated_at) VALUES (?, ?, ?)',
+              (session.session_id, json.dumps(data, default=str), datetime.now()))
+    conn.commit()
+    conn.close()
 
-def load_session(session_id: str) -> Optional[PPAHSession]:
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute('SELECT data FROM sessions WHERE session_id = ?', (session_id,))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            return PPAHSession(session_id, restore_data=json.loads(row[0]))
-    except Exception as e:
-        print(f"[DB ERROR] Load failed: {e}")
+def load_session(session_id: str):
+    conn = sqlite3.connect(DB_NAME)
+    row = conn.execute('SELECT data FROM sessions WHERE session_id = ?', (session_id,)).fetchone()
+    conn.close()
+    if row:
+        d = json.loads(row[0])
+        s = PPAHSession(d['session_id'], d['email'], d['webauthn_id'], d['session_key'])
+        s.status = d['status']
+        s.freeze_reason = d.get('freeze_reason')
+        return s
     return None
 
-@app.get('/api/auth/config')
-async def get_auth_config(request: Request):
-    client_host = request.url.hostname
-    rp_id = client_host if client_host not in ["localhost", "127.0.0.1"] else "localhost"
-    return {"rpId": rp_id, "rpName": "PPAH Enterprise", "msg": f"Secure Config for {rp_id}"}
+# --- ENDPOINTS ---
+
+# UPDATE: Check success of connection
+@app.websocket("/ws/{room_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str):
+    success = await manager.connect(websocket, room_id)
+    if not success:
+        return # Exit if rejected
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            await manager.broadcast(data, room_id, websocket)
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, room_id)
 
 @app.post('/api/session/init')
 async def initialize_session(request: InitSessionRequest):
     session_id = secrets.token_hex(16)
     session_key = secrets.token_hex(32)
-    
-    session = PPAHSession(
-        session_id, 
-        email=request.email,
-        camera_fingerprint=request.camera_fingerprint,
-        session_key=session_key
-    )
+    session = PPAHSession(session_id, request.email, request.webauthn_credential_id, session_key)
     save_session(session) 
-    
-    print(f"[SESSION] Initialized {session_id[:8]}")
-    return {
-        'session_id': session_id,
-        'session_key': session_key,
-        'status': 'initialized',
-        'camera_locked': session.camera_fingerprint_locked
-    }
+    return {'session_id': session_id, 'session_key': session_key, 'status': 'initialized'}
 
 @app.post('/api/verify-hash')
 async def verify_hash(request: VerifyHashRequest):
     session = load_session(request.session_id)
-    if not session: 
-        raise HTTPException(status_code=404, detail='Session not found')
-        
-    if not session.is_active(): 
-        raise HTTPException(status_code=403, detail=f'Session {session.status}')
+    if not session or session.status != "active": 
+        return {'valid': False, 'session_status': session.status if session else 'terminated'}
     
-    # PASS TRUST SCORE TO VALIDATION LOGIC
     valid = session.add_hash(request.segment_id, request.hash, request.trust_score, request.signature)
     save_session(session) 
-    
-    if not valid:
-        return {
-            'valid': False, 
-            'segment_id': request.segment_id, 
-            'reason': session.freeze_reason, 
-            'action': 'reauth_required'
-        }
-    
-    print(f"[VERIFY] {session.session_id[:8]} - Segment {request.segment_id} ✓ (Score: {request.trust_score})")
-    return {
-        'valid': True, 
-        'segment_id': request.segment_id, 
-        'session_status': session.status, 
-        'total_segments': session.segment_count
-    }
+    return {'valid': valid, 'session_status': session.status}
 
 @app.get('/api/session/{session_id}/security-report')
 async def get_security_report(session_id: str):
     session = load_session(session_id)
-    if not session: 
-        raise HTTPException(status_code=404, detail='Session not found')
-    return session.get_security_report()
-
-@app.get('/')
-async def root():
-    return {
-        'service': 'PPAH Enterprise API', 
-        'status': 'running', 
-        'version': '3.1.0',
-        'storage': 'SQLite',
-        'mode': 'Server Authority'
-    }
+    if not session: raise HTTPException(status_code=404)
+    return {'status': session.status, 'freeze_reason': session.freeze_reason, 'auth_method': 'WebAuthn+PPAH'}
 
 if __name__ == "__main__":
     import uvicorn
-    print("WARNING: Run with SSL in production to protect session keys!")
     uvicorn.run(app, host="0.0.0.0", port=8000)
