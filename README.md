@@ -1,111 +1,146 @@
-# PPAH 2.0: Privacy-Preserving Adaptive Hashing
+Here is a professional, comprehensive **README.md** for your project. I have structured it to highlight the upgrade from v2.0 to v3.0, specifically focusing on the new **Remote Session** capabilities.
 
-> **Multi-Modal Continuous Identity Verification for the Post-Deepfake Era**
+You can copy and paste this directly into your project root.
 
-[](https://opensource.org/licenses/MIT) [](https://www.google.com/search?q=https://github.com/Digho007/ppah) [](https://en.wikipedia.org/wiki/Zero-knowledge_proof)
+---
 
-## 📖 Overview
+# PPAH 3.0: Privacy-Preserving Adaptive Hashing with Remote Sessions
 
-**PPAH 2.0** is a web-based, privacy-first security framework designed to verify remote users continuously without resorting to intrusive surveillance.
+**PPAH 3.0** is a secure, privacy-first video verification platform designed to prevent deepfakes and unauthorized access in remote communications. Unlike PPAH 2.0, which focused on local verification, **PPAH 3.0 introduces real-time Remote Sessions**, allowing two parties to establish a cryptographically secured video call where user integrity is continuously monitored.
 
-Unlike traditional video calls (Zoom/Teams) that stream raw pixel data, PPAH uses **Client-Side Edge Computing** to analyze biometric and cryptographic signals locally. It transmits only mathematical hashes and digital signatures to the server, ensuring **Zero-Knowledge Privacy** while proving that the user is present, alive, and authorized.
+> **USP:** PPAH implements a **Zero-Trust Architecture**. It anchors digital identity to physical hardware (WebAuthn) and continuously signs video frames based on biometric trust scores, effectively rendering virtual camera injections and deepfakes useless.
 
-## 🚀 Key Innovations
+## 🚀 What's New in v3.0?
 
-### 1\. Multi-Modal Security Architecture
+* **Remote Session Support:** Users can now join secure "Rooms" via WebRTC to conduct verified video calls.
+* **Draggable PIP Interface:** A Zoom-style UI with a draggable local video (Picture-in-Picture) and full-screen remote view.
+* **Adaptive Trust Scoring:** Real-time monitoring that adjusts security checks based on user behavior (e.g., looking away, leaving the camera).
+* **Deepfake Resistance:** Cryptographic signing of every video frame ensures that the video feed cannot be hijacked by OBS or virtual cameras.
 
-The system employs a "Defense-in-Depth" strategy, layering four distinct security checks:
+## 🌟 Key Features
 
-  * **Hardware Layer:** WebAuthn (FIDO2) attestation locks the session to a specific physical device.
-  * **Temporal Layer:** Cryptographic Hash Chaining (`SHA-256`) detects frame injection or deletion attacks.
-  * **Biometric Layer:** Real-time histogram and edge-density analysis locks the session to the specific user's facial signature.
-  * **Integrity Layer:** **HMAC-SHA256** packet signing prevents Man-in-the-Middle (MitM) replay attacks.
+### 1. Hardware-Anchored Identity (WebAuthn)
 
-### 2\. Adaptive Trust Scoring
+* **No Passwords:** Login requires a physical FIDO2 key, Fingerprint, or FaceID.
+* **Anti-Phishing:** Credentials are bound to the specific domain, making phishing attacks impossible.
 
-Instead of a binary "Pass/Fail" that frustrates users, PPAH 3.0 uses an **Adaptive Trust Score (0-100)**.
+### 2. Adaptive Hashing & Integrity
 
-  * **Environmental Healing:** If lighting conditions change, the system lowers the trust score but continues monitoring. If the user remains consistent, the score "heals" back to 100%.
-  * **Rolling Anchors:** The biometric baseline evolves over time to adapt to natural environmental drift (e.g., sunset).
+* **Dynamic Signatures:** Every video frame is hashed and signed locally. The signature is valid *only* if the user's current Trust Score is high.
+* **Liveness Challenges:** If the Trust Score drops (e.g., < 60%), the system pauses the stream and forces a challenge (e.g., "Turn Head Left").
 
-### 3\. Ultra-Low Bandwidth
+### 3. Privacy-Preserving Monitoring
 
-By transmitting hashes instead of video, PPAH operates on **\< 1 Kbps** bandwidth, making high-security verification accessible in rural areas or on 2G/EDGE connections.
+* **Local Processing:** Biometric analysis (Face Detection, Head Pose) runs entirely in the browser (Client-Side).
+* **Minimal Data Leakage:** The server receives hashes and signatures, not raw biometric data.
 
-## 🛠️ Technical Architecture
+---
 
-### Frontend (Client)
+## 🛠️ Tech Stack
 
-  * **Framework:** Next.js (React)
-  * **Processing:** **Web Workers** offload heavy computer vision tasks (histograms, frame differencing) to a background thread, maintaining 60 FPS UI performance.
-  * **Algorithms:**
-      * *Biometrics:* Bhattacharyya Distance (Color Histograms) & Laplacian Edge Detection.
-      * *Liveness:* Frame-to-frame motion energy & Color Temperature analysis.
-      * *Optimization:* `Canvas2D` with `willReadFrequently: true` for hardware acceleration.
+* **Frontend:** Next.js (React), Tailwind CSS, MediaPipe (Biometrics), SimpleWebAuthn (FIDO2).
+* **Backend:** FastAPI (Python), SQLite (Database), WebSockets (Signaling).
+* **Security:** WebAuthn (FIDO2), HMAC-SHA256 (Frame Signing), WebRTC (P2P Encryption).
 
-### Backend (Server)
+---
 
-  * **Framework:** Python (FastAPI)
-  * **Verification:**
-      * **Sliding Window Logic:** Tolerates network packet loss (gaps of 1-2 frames) without breaking the security chain.
-      * **HMAC Verification:** Validates the cryptographic signature of every incoming heartbeat using a session-specific secret key.
-
-## ⚡ Quick Start
+## ⚡ Installation & Setup
 
 ### Prerequisites
 
-  * Node.js (v18+)
-  * Python (v3.9+)
+* Python 3.9+
+* Node.js 16+
+* Ngrok (Required for WebAuthn on mobile/remote testing)
 
-### 1\. Setup Backend
+### 1. Backend Setup (FastAPI)
+
+Navigate to the root directory:
 
 ```bash
-cd server
+# Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install fastapi uvicorn
-uvicorn ppah_server:app --reload --host 0.0.0.0 --port 8000
+
+# Activate (Windows)
+venv\Scripts\activate
+# Activate (Mac/Linux)
+source venv/bin/activate
+
+# Install dependencies
+pip install fastapi uvicorn webauthn[fastapi]
+
+# Start Server
+# NOTE: Update NGROK_DOMAIN in server/ppah_server.py first!
+python -m uvicorn server.ppah_server:app --reload --host 0.0.0.0 --port 8000
+
 ```
 
-### 2\. Setup Frontend
+### 2. Frontend Setup (Next.js)
+
+Open a new terminal:
 
 ```bash
-cd ../client
+cd client
+
+# Install dependencies
 npm install
+
+# Start Frontend
 npm run dev
+
 ```
 
-### 3\. Run the System
+### 3. Expose to Internet (Ngrok)
 
-Open `http://localhost:3000` (or your VM IP) in a browser.
+WebAuthn requires a secure context (HTTPS) or localhost. To test on mobile:
 
-## 🧪 Testing & Data Collection
+```bash
+ngrok http 3000
 
-To validate the system for research purposes, use the built-in simulation tools:
+```
 
-| Test Case | Action | Expected Outcome |
-| :--- | :--- | :--- |
-| **Normal Operation** | Run for 60s | Trust Score stays \> 90%. Logs show `[VERIFY] ... Segment X ✓`. |
-| **Injection Attack** | Click **"Simulate Attack"** button | Trust Score hits 0%. Server logs `[SECURITY] Segment sequence break`. |
-| **User Swap** | Have a different person enter frame | Console shows `[BIOMETRIC] Similarity: < 60%`. Trust Score drains. |
-| **Spoofing** | Hold up a static photo | Liveness score drops. System triggers "Turn Head" challenge. |
+*Copy the forwarding URL (e.g., `https://abcd-123.ngrok-free.app`) and update `NGROK_DOMAIN` in `server/ppah_server.py`.*
 
-## 🛡️ Privacy & Compliance
+---
 
-This project helps organizations meet **GDPR, CCPA, and NDPR** data minimization requirements:
+## 📱 Usage Guide
 
-1.  **No Face Storage:** Facial images are processed in volatile memory (RAM) and destroyed immediately.
-2.  **No Surveillance:** The server administrator cannot "watch" the user; they only see a cryptographic proof of presence.
+1. **Open the App:** Go to your Ngrok URL on your phone or desktop.
+2. **Register Key:** Click **"Register Key"**. Use your Fingerprint/FaceID when prompted.
+3. **Join a Room:** Enter a unique Room Name (e.g., `Exam-Room-1`) and click **"Start Secure Video Call"**.
+4. **Verification:** The system will verify your biometric key and initialize the camera.
+5. **The Session:**
+* **High Trust (100%):** Call proceeds normally.
+* **Low Trust (<60%):** You will be asked to perform a head movement challenge.
+* **Zero Trust (0%):** Session is flagged or terminated.
 
-## 🔮 Future Work
 
-  * **Deep Learning Integration:** Replacing heuristic histograms with client-side TensorFlow.js (MediaPipe) for higher accuracy on high-end devices.
-  * **Zero-Knowledge Proofs (ZKP):** Implementing zk-SNARKs to prove liveness without revealing any biometric metadata.
+
+---
+
+## ⚠️ Troubleshooting
+
+**"User Not Found" Error:**
+
+* You must click **"Register Key"** *before* trying to start a call. The system needs to save your public key first.
+
+**"Hardware Authentication" Fails Immediately:**
+
+* Check your `server/ppah_server.py`. Ensure `NGROK_DOMAIN` matches your browser URL **exactly** (no `https://` prefix in the variable).
+* Ensure you are accessing via HTTPS (Ngrok), not HTTP.
+
+**Database Errors (sqlite3):**
+
+* If you changed the schema recently, delete the old database file:
+```bash
+rm server/ppah_enterprise.db
+
+```
+
+
+The server will recreate it automatically on restart.
+
+---
 
 ## 📄 License
 
-Distributed under the MIT License. See `LICENSE` for more information.
-
------
-
-*Research & Implementation by Jeremiah Dighomanor.*
+This project is proprietary software developed for high-security verification research. Unauthorized copying or distribution is prohibited.
