@@ -1,9 +1,3 @@
-Here is a professional, comprehensive **README.md** for your project. I have structured it to highlight the upgrade from v2.0 to v3.0, specifically focusing on the new **Remote Session** capabilities.
-
-You can copy and paste this directly into your project root.
-
----
-
 # PPAH 3.0: Privacy-Preserving Adaptive Hashing with Remote Sessions
 
 **PPAH 3.0** is a secure, privacy-first video verification platform designed to prevent deepfakes and unauthorized access in remote communications. Unlike PPAH 2.0, which focused on local verification, **PPAH 3.0 introduces real-time Remote Sessions**, allowing two parties to establish a cryptographically secured video call where user integrity is continuously monitored.
