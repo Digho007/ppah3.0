@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software in your research, please cite it as below."
+authors:
+  - family-names: "Dighomanor"
+    given-names: "Jeremiah"
+    affiliation: "Wale Lab Fellow"
+title: "PPAH 3.0: Privacy-Preserving Adaptive Hashing Verification System"
+version: 3.0.0
+date-released: 2025-12-18
+url: "https://github.com/Digho007/ppah3.0"
+abstract: >-
+  A Multi-Modal Biometric Verification System featuring Hash Chain integrity, 
+  HMAC packet signing, and adaptive trust logic. This system is designed to 
+  prevent deepfake injection and unauthorized access in remote sessions while 
+  preserving user privacy through client-side processing.
+keywords:
+  - biometric-authentication
+  - privacy-preserving
+  - deepfake-detection
+  - zero-knowledge-proofs
+  - hash-chain
+  - webrtc
+  - cyber-security
+license: Apache-2.0
+repository-code: "https://github.com/Digho007/ppah3.0"
