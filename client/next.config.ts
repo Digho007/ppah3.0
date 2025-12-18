@@ -9,7 +9,8 @@ const nextConfig: NextConfig = {
       },
       {
         source: '/ws/:path*',
-        destination: 'http://127.0.0.1:8000/ws/:path*',
+        // CHANGE BACK TO HTTP (Next.js handles the WS upgrade internally)
+        destination: 'http://127.0.0.1:8000/ws/:path*', 
       },
     ];
   },

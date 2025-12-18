@@ -1,6 +1,6 @@
 "use client";
 import React, { useState, useRef, useEffect } from 'react';
-import { Shield, Phone, PhoneOff, UserX, Fingerprint, PlusCircle, Move, Users, User } from 'lucide-react';
+import { Shield, Phone, PhoneOff, UserX, Fingerprint, PlusCircle, Move, Signal, RefreshCw, AlertCircle } from 'lucide-react';
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
 
@@ -26,9 +26,14 @@ const PPAHVerification = () => {
   const [step, setStep] = useState('idle');
   const [userEmail, setUserEmail] = useState("user@example.com");
   const [sessionId, setSessionId] = useState<string | null>(null);
+  
+  // ROOM STATE
   const [roomId, setRoomId] = useState('');
   const [tempRoomId, setTempRoomId] = useState('');
+  
+  // DIAGNOSTICS & STATUS
   const [statusMessage, setStatusMessage] = useState('Ready');
+  const [iceStatus, setIceStatus] = useState('New'); // New, Checking, Connected, Failed
   const [trustScore, setTrustScore] = useState(100);
   const [remoteTrustScore, setRemoteTrustScore] = useState<number | null>(null);
   const [remoteSessionId, setRemoteSessionId] = useState<string | null>(null);
@@ -38,6 +43,8 @@ const PPAHVerification = () => {
   const [faceDetected, setFaceDetected] = useState(true);
   const [challengeActive, setChallengeActive] = useState(false);
   const [currentChallenge, setCurrentChallenge] = useState<string | null>(null);
+  
+  // DRAGGABLE PIP STATE
   const [pipPosition, setPipPosition] = useState({ x: 20, y: 20 });
   const [isDragging, setIsDragging] = useState(false);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
@@ -60,14 +67,19 @@ const PPAHVerification = () => {
   const landmarkerRef = useRef<FaceLandmarker | null>(null);
   const challengeActiveRef = useRef(false);
   
-  // Debounce
+  // Debounce Counters
   const noFaceCounter = useRef(0);
   const lowBioCounter = useRef(0);
   const lastSuccessTimeRef = useRef<number>(0);
 
   useEffect(() => { trustScoreRef.current = trustScore; }, [trustScore]);
 
-  // --- PROXY HELPERS ---
+  // --- HELPER: JOIN ROOM ---
+  const joinRoom = () => {
+      const cleanId = tempRoomId.trim().toLowerCase();
+      if(cleanId) setRoomId(cleanId);
+  };
+
   const getBackendUrl = () => ""; 
   const getWsUrl = () => {
     if (typeof window !== 'undefined') {
@@ -90,25 +102,20 @@ const PPAHVerification = () => {
                 runningMode: "VIDEO",
                 numFaces: 1
             });
-        } catch (e) {
-            console.warn("MediaPipe Load Error (Ignored)", e);
-        }
+        } catch (e) { console.warn("MediaPipe Load Error", e); }
     };
     loadModel();
 
     workerRef.current = new Worker('/biometric-worker.js');
     workerRef.current.onmessage = (e) => {
-      const { type, similarity, liveness, fingerprint } = e.data;
+      const { type, similarity, fingerprint } = e.data;
       if (type === 'ANALYSIS_RESULT') {
         if (challengeActiveRef.current) return;
-
         if (typeof similarity === 'number' && anchorBiometricRef.current) {
           if (similarity < 0.45) {
              lowBioCounter.current += 1;
              if (lowBioCounter.current > 3) handleSecurityEvent("Identity Mismatch", 10);
-          } else {
-             lowBioCounter.current = 0;
-          }
+          } else { lowBioCounter.current = 0; }
         }
       } else if (type === 'ANCHOR_GENERATED') {
         anchorBiometricRef.current = fingerprint;
@@ -119,13 +126,11 @@ const PPAHVerification = () => {
 
   const handleSecurityEvent = (reason: string, penalty: number) => {
       if (challengeActiveRef.current) return;
-      
       if (Date.now() - lastSuccessTimeRef.current < 10000) {
           setTrustScore(prev => Math.min(100, prev + 2)); 
           setStatusMessage("Verifying... (Secure)");
           return;
       }
-
       setTrustScore(prev => {
           const newScore = Math.max(0, prev - penalty);
           if (newScore < 40 && !challengeActiveRef.current) triggerLivenessChallenge();
@@ -141,7 +146,7 @@ const PPAHVerification = () => {
     if (monitoringRef.current) clearInterval(monitoringRef.current);
   };
 
-  // --- 3. WEBAUTHN (SAFE WRAPPERS) ---
+  // --- 3. WEBAUTHN ---
   const registerSecurityKey = async () => {
     try {
         setStatusMessage("Registering Key...");
@@ -150,23 +155,15 @@ const PPAHVerification = () => {
             body: JSON.stringify({ email: userEmail })
         });
         const options = await resp.json();
-        
         const attResp = await startRegistration(options);
-        
         const verifyResp = await fetch(`${getBackendUrl()}/api/webauthn/register/verify`, {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ email: userEmail, response: attResp })
         });
         if (verifyResp.ok) setStatusMessage("Key Registered Successfully! ✅");
         else setStatusMessage("Registration Failed ❌");
-
     } catch (error: any) {
-        if (error.name === 'NotAllowedError') {
-            setStatusMessage("Registration Cancelled");
-        } else {
-            console.warn(error);
-            setStatusMessage("Registration Error");
-        }
+        setStatusMessage(error.name === 'NotAllowedError' ? "Registration Cancelled" : "Registration Error");
     }
   };
 
@@ -184,9 +181,7 @@ const PPAHVerification = () => {
             return false;
         }
         const options = await resp.json();
-        
         const authResp = await startAuthentication(options);
-        
         const verifyResp = await fetch(`${getBackendUrl()}/api/webauthn/login/verify`, {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ email: userEmail, response: authResp })
@@ -208,29 +203,95 @@ const PPAHVerification = () => {
     return false;
   };
 
-  // --- 4. SIGNALING ---
+  // --- 4. SIGNALING & CONNECTIVITY (EXPRESSTURN ENABLED) ---
+  const restartIce = () => {
+     if(socketRef.current && peerConnection.current) {
+         socketRef.current.close();
+         peerConnection.current.close();
+         setIceStatus('Restarting...');
+         setTimeout(() => startCall(sessionId!), 1000);
+     }
+  };
+
   const startCall = async (activeSessionId: string) => {
     if (!streamRef.current) return;
     setInCall(true);
-    socketRef.current = new WebSocket(getWsUrl());
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    setIceStatus('Connecting...');
+    
+    // --- UPDATED ICE SERVERS (With ExpressTURN) ---
+    const pc = new RTCPeerConnection({ 
+        iceServers: [
+            // 1. Google STUN (Backup)
+            { urls: 'stun:stun.l.google.com:19302' },
+            
+            // 2. ExpressTURN (Port 3480 as requested)
+            {
+                urls: "turn:relay1.expressturn.com:3480", 
+                username: "000000002081401268", 
+                credential: "cTgF/eRaT2gKMgz80O1wl1DbNCo=" 
+            },
+            // 3. ExpressTURN (Port 443 Fallback for strict firewalls)
+            {
+                urls: "turn:relay1.expressturn.com:443", 
+                username: "000000002081401268", 
+                credential: "cTgF/eRaT2gKMgz80O1wl1DbNCo=" 
+            }
+        ] 
+    });
+    
+    pc.oniceconnectionstatechange = () => {
+        const state = pc.iceConnectionState;
+        console.log("ICE State:", state);
+        setIceStatus(state.charAt(0).toUpperCase() + state.slice(1));
+        if (state === 'failed' || state === 'disconnected') {
+            setStatusMessage("Connection Lost. Try Retrying.");
+        }
+    };
+
     streamRef.current.getTracks().forEach(track => pc.addTrack(track, streamRef.current!));
-    pc.ontrack = (event) => { if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0]; };
-    pc.onicecandidate = (event) => { if (event.candidate) socketRef.current?.send(JSON.stringify({ type: 'ice', candidate: event.candidate })); };
+    
+    pc.ontrack = (event) => { 
+        console.log("REMOTE STREAM RECEIVED");
+        if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = event.streams[0];
+        }
+    };
+    
+    pc.onicecandidate = (event) => { 
+        if (event.candidate) {
+            socketRef.current?.send(JSON.stringify({ type: 'ice', candidate: event.candidate })); 
+        }
+    };
+    
     peerConnection.current = pc;
+
+    socketRef.current = new WebSocket(getWsUrl());
+    
     socketRef.current.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
         if (msg.type === 'identify') setRemoteSessionId(msg.sessionId);
+        
         if (msg.type === 'offer') {
             await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             socketRef.current?.send(JSON.stringify({ type: 'answer', sdp: answer }));
             socketRef.current?.send(JSON.stringify({ type: 'identify', sessionId: activeSessionId }));
-        } else if (msg.type === 'answer') await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-        else if (msg.type === 'ice') await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        } 
+        else if (msg.type === 'answer') {
+            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        } 
+        else if (msg.type === 'ice') {
+            await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        }
+        else if (msg.type === 'error' && msg.message === 'ROOM_FULL') {
+            alert("Room is full! Only 2 people allowed.");
+            window.location.reload();
+        }
     };
+
     socketRef.current.onopen = async () => {
+        setIceStatus('Negotiating...');
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         socketRef.current?.send(JSON.stringify({ type: 'offer', sdp: offer }));
@@ -238,10 +299,9 @@ const PPAHVerification = () => {
     };
   };
 
-  // --- 5. CHALLENGE (SAFE) ---
+  // --- 5. CHALLENGE ---
   const triggerLivenessChallenge = async () => {
     if (challengeActiveRef.current || !landmarkerRef.current) return;
-    
     challengeActiveRef.current = true;
     setChallengeActive(true);
     
@@ -258,9 +318,7 @@ const PPAHVerification = () => {
 
     while (Date.now() - startTime < 5000) {
         if (videoRef.current && landmarkerRef.current && 
-            videoRef.current.readyState >= 2 && 
-            videoRef.current.videoWidth > 0 && 
-            videoRef.current.videoHeight > 0) {
+            videoRef.current.readyState >= 2 && videoRef.current.videoWidth > 0) {
             try {
                 const results = landmarkerRef.current.detectForVideo(videoRef.current, performance.now());
                 if (results.faceLandmarks.length > 0) {
@@ -290,15 +348,14 @@ const PPAHVerification = () => {
     challengeActiveRef.current = false;
   };
 
-  // --- 6. MONITORING (SAFE) ---
+  // --- 6. MONITORING ---
   const startMonitoring = (activeSid: string) => {
     let seg = 1;
     monitoringRef.current = setInterval(async () => {
         const video = videoRef.current;
         const canvas = canvasRef.current;
         if (!video || !canvas) return;
-
-        const isReady = video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0;
+        const isReady = video.readyState >= 2 && video.videoWidth > 0;
         
         if (landmarkerRef.current && isReady) {
             try {
@@ -324,19 +381,15 @@ const PPAHVerification = () => {
         if (ctx && isReady) {
             ctx.drawImage(video, 0, 0);
             const imgData = ctx.getImageData(0,0,640,480);
-            
             if (seg === 1) workerRef.current?.postMessage({ type: 'GENERATE_ANCHOR', imageData: imgData });
             else if (!challengeActiveRef.current) {
                 workerRef.current?.postMessage({ type: 'ANALYZE_FRAME', imageData: imgData, anchorBiometric: anchorBiometricRef.current });
             }
-            
             const hashBuf = await crypto.subtle.digest('SHA-256', imgData.data);
             const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
             const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
-            
             await fetch(`${getBackendUrl()}/api/verify-hash`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
+                method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ session_id: activeSid, segment_id: seg, hash: hashHex, trust_score: trustScoreRef.current, signature: sig })
             });
             seg++;
@@ -355,15 +408,10 @@ const PPAHVerification = () => {
   };
 
   const startVerification = async () => {
-    if (!roomId.trim()) {
-      setStatusMessage('❌ Please enter a room name');
-      return;
-    }
-    
+    if (!roomId.trim()) { setStatusMessage('❌ Enter Room Name'); return; }
     const authSuccess = await performWebAuthnLogin();
     if (!authSuccess) return;
 
-    // STEP = INITIALIZING (Local Video becomes BIG)
     setStep('initializing');
     const cam = await initializeCamera();
     if (cam) {
@@ -377,8 +425,6 @@ const PPAHVerification = () => {
         
         startMonitoring(data.session_id);
         await startCall(data.session_id);
-        
-        // STEP = ACTIVE (Local Video shrinks to PIP, Remote Video becomes BIG)
         setStep('active');
         setStatusMessage('Secure Call Active');
     }
@@ -394,28 +440,14 @@ const PPAHVerification = () => {
 
   // --- DRAGGING HANDLERS ---
   const handleMouseDown = (e: React.MouseEvent) => {
-    // Only allow drag if in PIP mode (step === 'active')
     if (step !== 'active') return; 
-
     setIsDragging(true);
-    setDragOffset({
-      x: e.clientX - pipPosition.x,
-      y: e.clientY - pipPosition.y
-    });
+    setDragOffset({ x: e.clientX - pipPosition.x, y: e.clientY - pipPosition.y });
   };
-
   const handleMouseMove = (e: MouseEvent) => {
-    if (isDragging) {
-      setPipPosition({
-        x: e.clientX - dragOffset.x,
-        y: e.clientY - dragOffset.y
-      });
-    }
+    if (isDragging) setPipPosition({ x: e.clientX - dragOffset.x, y: e.clientY - dragOffset.y });
   };
-
-  const handleMouseUp = () => {
-    setIsDragging(false);
-  };
+  const handleMouseUp = () => setIsDragging(false);
 
   useEffect(() => {
     if (isDragging) {
@@ -429,17 +461,18 @@ const PPAHVerification = () => {
   }, [isDragging, dragOffset]);
 
   useEffect(() => {
-    if (!remoteSessionId) return;
-    const interval = setInterval(async () => {
-        try {
-            const res = await fetch(`${getBackendUrl()}/api/session/${remoteSessionId}/security-report`);
-            if (res.ok) {
-                const data = await res.json();
-                setRemoteTrustScore(data.status === 'active' ? 100 : 0);
-            }
-        } catch (e) {}
-    }, 2000); 
-    return () => clearInterval(interval);
+    if (remoteSessionId) {
+      const interval = setInterval(async () => {
+          try {
+              const res = await fetch(`${getBackendUrl()}/api/session/${remoteSessionId}/security-report`);
+              if (res.ok) {
+                  const data = await res.json();
+                  setRemoteTrustScore(data.status === 'active' ? 100 : 0);
+              }
+          } catch (e) {}
+      }, 2000); 
+      return () => clearInterval(interval);
+    }
   }, [remoteSessionId]);
 
   return (
@@ -455,22 +488,30 @@ const PPAHVerification = () => {
                      <input 
                         value={tempRoomId} 
                         onChange={(e) => setTempRoomId(e.target.value)} 
-                        onKeyPress={(e) => e.key === 'Enter' && setRoomId(tempRoomId)}
+                        onKeyPress={(e) => e.key === 'Enter' && joinRoom()}
                         className="bg-slate-800 p-2 rounded text-sm border border-slate-600 focus:border-blue-500 outline-none" 
-                        placeholder="Enter room name (e.g., uk-meeting)"
+                        placeholder="Enter room (e.g., uk-meeting)"
                      />
-                     <button 
-                        onClick={() => setRoomId(tempRoomId)}
-                        className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded text-sm font-semibold"
-                     >
+                     <button onClick={joinRoom} className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded text-sm font-semibold">
                         Join Room
                      </button>
                 </div>
             )}
             {step !== 'idle' && roomId && (
-                <div className="bg-slate-800 px-4 py-2 rounded border border-blue-500/50">
-                    <span className="text-xs text-slate-400">Room: </span>
-                    <span className="font-mono text-blue-400 font-bold">{roomId}</span>
+                <div className="flex gap-4 items-center">
+                    <div className="bg-slate-800 px-4 py-2 rounded border border-blue-500/50">
+                        <span className="text-xs text-slate-400">Room: </span>
+                        <span className="font-mono text-blue-400 font-bold">{roomId}</span>
+                    </div>
+                    {/* STATUS INDICATOR */}
+                    {step === 'active' && (
+                        <div className={`px-3 py-1 rounded text-xs font-bold flex gap-1 items-center ${
+                            iceStatus === 'Connected' ? 'bg-green-900 text-green-300' :
+                            iceStatus === 'Failed' ? 'bg-red-900 text-red-300' : 'bg-yellow-900 text-yellow-300'
+                        }`}>
+                            <Signal size={12} /> {iceStatus}
+                        </div>
+                    )}
                 </div>
             )}
         </header>
@@ -486,14 +527,13 @@ const PPAHVerification = () => {
         )}
 
         <div className="relative">
-            {/* REMOTE VIDEO - BACKGROUND LAYER */}
-            {/* Only shown when in active call */}
+            {/* REMOTE VIDEO */}
             <div className={`bg-slate-800 rounded-2xl overflow-hidden shadow-xl border border-slate-700 relative h-[600px] transition-all duration-500 z-0`}>
                 <div className="absolute top-4 left-4 z-10 bg-black/70 backdrop-blur px-3 py-1 rounded text-xs text-white font-semibold">
                     {remoteSessionId ? 'REMOTE USER' : 'WAITING FOR CONNECTION...'}
                 </div>
                 
-                {/* IDLE UI when no call is active */}
+                {/* IDLE UI */}
                 {!inCall && step !== 'active' && (
                     <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400 bg-slate-900">
                         <Phone size={48} className="mb-4 opacity-50" />
@@ -501,94 +541,85 @@ const PPAHVerification = () => {
                         {roomId && <p className="text-xs mt-2 font-mono text-blue-400">Room: {roomId}</p>}
                     </div>
                 )}
+                
+                {/* DIAGNOSTICS */}
+                {iceStatus !== 'Connected' && inCall && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-20 text-center p-4">
+                         <AlertCircle className="text-yellow-500 mb-2" size={32} />
+                         <h3 className="text-white font-bold text-lg">Connecting...</h3>
+                         <p className="text-slate-400 text-sm mb-4">Status: {iceStatus}</p>
+                         <button onClick={restartIce} className="bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded text-white text-sm flex gap-2">
+                             <RefreshCw size={14} /> Retry Connection
+                         </button>
+                    </div>
+                )}
 
                 <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover bg-black" />
                 
-                {/* Remote Trust Score Overlay */}
+                {/* Trust Score */}
                 <div className="absolute bottom-4 left-4 right-4 z-10">
                     <div className="bg-black/70 backdrop-blur p-3 rounded-lg">
                         <div className="flex justify-between items-center mb-2">
                             <span className="text-xs uppercase text-slate-300">Remote Verification</span>
                             {remoteTrustScore !== null ? (
                                 <span className={`font-mono font-bold flex gap-2 items-center ${remoteTrustScore > 80 ? 'text-green-400' : 'text-red-400'}`}>
-                                    {remoteTrustScore > 80 ? <Shield size={14}/> : <AlertTriangle size={14}/>}
-                                    {remoteTrustScore}%
+                                    {remoteTrustScore > 80 ? <Shield size={14}/> : <AlertTriangle size={14}/>} {remoteTrustScore}%
                                 </span>
                             ) : <span className="text-slate-400 text-xs">CONNECTING...</span>}
                         </div>
                         <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
-                            <div className={`h-full transition-all ${remoteTrustScore && remoteTrustScore > 80 ? 'bg-blue-500' : 'bg-red-500'}`} 
-                                style={{width: `${remoteTrustScore || 0}%`}} />
+                            <div className={`h-full transition-all ${remoteTrustScore && remoteTrustScore > 80 ? 'bg-blue-500' : 'bg-red-500'}`} style={{width: `${remoteTrustScore || 0}%`}} />
                         </div>
                     </div>
                 </div>
             </div>
 
-            {/* YOUR VIDEO - DYNAMIC LAYOUT */}
-            {/* If 'initializing': Show BIG (Fullscreen overlay) */}
-            {/* If 'active': Show SMALL (PIP, Draggable) */}
+            {/* YOUR VIDEO (PIP) */}
             {(step === 'active' || step === 'initializing') && (
                 <div 
                     className={
                         step === 'initializing' 
-                        ? "fixed inset-0 z-50 bg-slate-900 flex items-center justify-center" // Fullscreen mode
-                        : "absolute z-20 bg-slate-800 rounded-xl overflow-hidden shadow-2xl border-2 border-slate-600 cursor-move select-none" // PIP mode
+                        ? "fixed inset-0 z-50 bg-slate-900 flex items-center justify-center"
+                        : "absolute z-20 bg-slate-800 rounded-xl overflow-hidden shadow-2xl border-2 border-slate-600 cursor-move select-none"
                     }
                     style={step === 'active' ? {
                         left: `${pipPosition.x}px`,
                         top: `${pipPosition.y}px`,
                         width: '240px',
                         height: '320px'
-                    } : {}} // No style overrides when fullscreen
+                    } : {}}
                     onMouseDown={handleMouseDown}
                 >
-                    <div className="absolute top-2 left-2 z-30 bg-black/70 backdrop-blur px-2 py-1 rounded text-xs text-white font-semibold">
-                        YOU
-                    </div>
-                    {/* Move Icon only visible in PIP */}
+                    <div className="absolute top-2 left-2 z-30 bg-black/70 backdrop-blur px-2 py-1 rounded text-xs text-white font-semibold">YOU</div>
                     {step === 'active' && (
-                        <div className="absolute top-2 right-2 z-30 bg-black/50 p-1 rounded-full">
-                            <Move size={12} className="text-white" />
-                        </div>
+                        <div className="absolute top-2 right-2 z-30 bg-black/50 p-1 rounded-full"><Move size={12} className="text-white" /></div>
                     )}
 
                     <div className="relative h-full w-full">
                         <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover transform scale-x-[-1] bg-black" />
                         
-                        {/* Challenge Overlay */}
                         {challengeActive && currentChallenge && (
                             <div className="absolute inset-0 bg-black/90 backdrop-blur z-20 flex flex-col items-center justify-center">
                                 <div className="text-3xl mb-2">👮</div>
                                 <h3 className="text-sm font-bold text-white mb-1">Security Check</h3>
-                                <div className="text-sm text-yellow-400 font-mono font-bold bg-slate-900 px-3 py-1 rounded border border-yellow-500/50">
-                                    {currentChallenge}
-                                </div>
+                                <div className="text-sm text-yellow-400 font-mono font-bold bg-slate-900 px-3 py-1 rounded border border-yellow-500/50">{currentChallenge}</div>
                             </div>
                         )}
                         
-                        {/* Face Not Detected Warning */}
                         {!faceDetected && !challengeActive && step === 'active' && (
                             <div className="absolute inset-0 flex items-center justify-center pointer-events-none bg-red-900/50">
-                                <div className="bg-red-600 text-white px-2 py-1 rounded text-xs font-bold flex gap-1 items-center">
-                                    <UserX size={12} /> NO FACE
-                                </div>
+                                <div className="bg-red-600 text-white px-2 py-1 rounded text-xs font-bold flex gap-1 items-center"><UserX size={12} /> NO FACE</div>
                             </div>
                         )}
                     </div>
                     
-                    {/* Your Trust Score (Bottom Bar) */}
                     <div className="absolute bottom-0 left-0 right-0 bg-black/80 backdrop-blur p-2">
                         <div className="flex justify-between items-center mb-1">
                             <span className="text-xs text-slate-300">Trust</span>
-                            <span className={`font-mono text-xs font-bold ${trustScore > 80 ? 'text-green-400' : 'text-red-400'}`}>
-                                {trustScore}%
-                            </span>
+                            <span className={`font-mono text-xs font-bold ${trustScore > 80 ? 'text-green-400' : 'text-red-400'}`}>{trustScore}%</span>
                         </div>
                         <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
-                            <div 
-                                className={`h-full transition-all duration-300 ${trustScore > 80 ? 'bg-green-500' : 'bg-red-500'}`} 
-                                style={{width: `${trustScore}%`}} 
-                            />
+                            <div className={`h-full transition-all duration-300 ${trustScore > 80 ? 'bg-green-500' : 'bg-red-500'}`} style={{width: `${trustScore}%`}} />
                         </div>
                         <div className="text-xs text-slate-400 mt-1 text-center truncate">{statusMessage}</div>
                     </div>
