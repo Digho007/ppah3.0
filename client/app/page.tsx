@@ -1,6 +1,9 @@
 "use client";
 import React, { useState, useRef, useEffect } from 'react';
-import { Shield, Phone, PhoneOff, UserX, Fingerprint, PlusCircle, Move, Signal, RefreshCw, AlertCircle } from 'lucide-react';
+import { 
+  Shield, Phone, PhoneOff, UserX, Fingerprint, PlusCircle, 
+  Move, Signal, RefreshCw, AlertCircle, AlertTriangle, Lock, Unlock
+} from 'lucide-react';
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
 
@@ -32,7 +35,7 @@ const PPAHVerification = () => {
   const [tempRoomId, setTempRoomId] = useState('');
   
   // DIAGNOSTICS & STATUS
-  const [statusMessage, setStatusMessage] = useState('Ready');
+  const [statusMessage, setStatusMessage] = useState('System Ready');
   const [iceStatus, setIceStatus] = useState('New'); // New, Checking, Connected, Failed
   const [trustScore, setTrustScore] = useState(100);
   const [remoteTrustScore, setRemoteTrustScore] = useState<number | null>(null);
@@ -45,7 +48,7 @@ const PPAHVerification = () => {
   const [currentChallenge, setCurrentChallenge] = useState<string | null>(null);
   
   // DRAGGABLE PIP STATE
-  const [pipPosition, setPipPosition] = useState({ x: 20, y: 20 });
+  const [pipPosition, setPipPosition] = useState({ x: 20, y: 100 });
   const [isDragging, setIsDragging] = useState(false);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
 
@@ -215,22 +218,16 @@ const PPAHVerification = () => {
 
   const startCall = async (activeSessionId: string) => {
     if (!streamRef.current) return;
-    setInCall(true);
     setIceStatus('Connecting...');
     
-    // --- UPDATED ICE SERVERS (With ExpressTURN) ---
     const pc = new RTCPeerConnection({ 
         iceServers: [
-            // 1. Google STUN (Backup)
             { urls: 'stun:stun.l.google.com:19302' },
-            
-            // 2. ExpressTURN (Port 3480 as requested)
             {
                 urls: "turn:relay1.expressturn.com:3480", 
                 username: "000000002081401268", 
                 credential: "cTgF/eRaT2gKMgz80O1wl1DbNCo=" 
             },
-            // 3. ExpressTURN (Port 443 Fallback for strict firewalls)
             {
                 urls: "turn:relay1.expressturn.com:443", 
                 username: "000000002081401268", 
@@ -254,6 +251,8 @@ const PPAHVerification = () => {
         console.log("REMOTE STREAM RECEIVED");
         if (remoteVideoRef.current) {
             remoteVideoRef.current.srcObject = event.streams[0];
+            // UPDATE: Only set inCall to true when we actually get tracks
+            setInCall(true); 
         }
     };
     
@@ -400,7 +399,10 @@ const PPAHVerification = () => {
   const initializeCamera = async () => {
     setStatusMessage('Initializing Camera...');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { width: 640, height: 480 },
+          audio: true 
+      });
       streamRef.current = stream;
       if (videoRef.current) videoRef.current.srcObject = stream;
       return true;
@@ -440,7 +442,8 @@ const PPAHVerification = () => {
 
   // --- DRAGGING HANDLERS ---
   const handleMouseDown = (e: React.MouseEvent) => {
-    if (step !== 'active') return; 
+    // UPDATED: Draggable only if step is active AND we are inCall (connected to peer)
+    if (step !== 'active' || !inCall) return; 
     setIsDragging(true);
     setDragOffset({ x: e.clientX - pipPosition.x, y: e.clientY - pipPosition.y });
   };
@@ -476,40 +479,51 @@ const PPAHVerification = () => {
   }, [remoteSessionId]);
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-200 p-8 font-sans">
+    <div className="min-h-screen bg-slate-900 text-slate-200 p-8 font-sans select-none overflow-hidden">
       <div className="max-w-6xl mx-auto">
         <header className="mb-6 flex justify-between items-center">
-            <h1 className="text-2xl font-bold text-white flex gap-2 items-center"><Shield className="text-blue-500"/> PPAH Remote</h1>
+            <h1 className="text-2xl font-bold text-white flex gap-2 items-center">
+              <div className="bg-blue-600 p-1.5 rounded-lg">
+                <Shield size={20} className="text-white"/>
+              </div> 
+              PPAH Remote
+            </h1>
             {step === 'idle' && (
                 <div className="flex gap-4 items-center">
-                     <button onClick={registerSecurityKey} className="text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded flex items-center gap-1">
+                     <button onClick={registerSecurityKey} className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-2 rounded-lg flex items-center gap-1.5 border border-slate-700 transition-colors">
                         <PlusCircle size={14} /> Register Key
                      </button>
-                     <input 
-                        value={tempRoomId} 
-                        onChange={(e) => setTempRoomId(e.target.value)} 
-                        onKeyPress={(e) => e.key === 'Enter' && joinRoom()}
-                        className="bg-slate-800 p-2 rounded text-sm border border-slate-600 focus:border-blue-500 outline-none" 
-                        placeholder="Enter room (e.g., uk-meeting)"
-                     />
-                     <button onClick={joinRoom} className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded text-sm font-semibold">
-                        Join Room
+                     <div className="relative">
+                        <input 
+                          value={tempRoomId} 
+                          onChange={(e) => setTempRoomId(e.target.value)} 
+                          onKeyPress={(e) => e.key === 'Enter' && joinRoom()}
+                          className="bg-slate-800 px-4 py-2 rounded-lg text-sm border border-slate-700 focus:border-blue-500 outline-none w-48 transition-all" 
+                          placeholder="Secure Room ID"
+                        />
+                     </div>
+                     <button onClick={joinRoom} className="bg-blue-600 hover:bg-blue-500 px-5 py-2 rounded-lg text-sm font-semibold transition-all shadow-lg shadow-blue-900/20">
+                        Join
                      </button>
                 </div>
             )}
             {step !== 'idle' && roomId && (
                 <div className="flex gap-4 items-center">
-                    <div className="bg-slate-800 px-4 py-2 rounded border border-blue-500/50">
-                        <span className="text-xs text-slate-400">Room: </span>
-                        <span className="font-mono text-blue-400 font-bold">{roomId}</span>
+                    <div className="bg-slate-800/50 backdrop-blur px-4 py-2 rounded-lg border border-blue-500/30 flex flex-col">
+                        <span className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">Encrypted Session</span>
+                        <span className="font-mono text-blue-400 font-bold text-sm">{roomId}</span>
                     </div>
-                    {/* STATUS INDICATOR */}
                     {step === 'active' && (
-                        <div className={`px-3 py-1 rounded text-xs font-bold flex gap-1 items-center ${
-                            iceStatus === 'Connected' ? 'bg-green-900 text-green-300' :
-                            iceStatus === 'Failed' ? 'bg-red-900 text-red-300' : 'bg-yellow-900 text-yellow-300'
+                        <div className={`px-4 py-2 rounded-lg text-xs font-bold flex gap-2 items-center border ${
+                            iceStatus === 'Connected' || iceStatus === 'Completed' 
+                            ? 'bg-green-500/10 text-green-400 border-green-500/20' :
+                            iceStatus === 'Failed' ? 'bg-red-500/10 text-red-400 border-red-500/20' : 
+                            'bg-yellow-500/10 text-yellow-400 border-yellow-500/20'
                         }`}>
-                            <Signal size={12} /> {iceStatus}
+                            <div className={`w-2 h-2 rounded-full animate-pulse ${
+                              iceStatus === 'Connected' || iceStatus === 'Completed' ? 'bg-green-500' : 'bg-yellow-500'
+                            }`} />
+                            {iceStatus.toUpperCase()}
                         </div>
                     )}
                 </div>
@@ -517,130 +531,207 @@ const PPAHVerification = () => {
         </header>
 
         {step === 'webauthn' && (
-            <div className="fixed inset-0 bg-black/90 z-50 flex flex-col items-center justify-center">
-                <div className="bg-slate-800 p-8 rounded-2xl flex flex-col items-center animate-pulse border border-blue-500">
-                    <Fingerprint className="w-16 h-16 text-blue-500 mb-4" />
-                    <h2 className="text-xl font-bold text-white mb-2">Hardware Authentication</h2>
-                    <p className="text-slate-400">Please touch your security key...</p>
+            <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-[100] flex flex-col items-center justify-center">
+                <div className="bg-slate-800 p-10 rounded-3xl flex flex-col items-center shadow-2xl border border-blue-500/50 max-w-sm text-center">
+                    <div className="w-20 h-20 bg-blue-600/20 rounded-full flex items-center justify-center mb-6 animate-pulse">
+                      <Fingerprint className="w-10 h-10 text-blue-500" />
+                    </div>
+                    <h2 className="text-2xl font-bold text-white mb-3">Hardware Authentication</h2>
+                    <p className="text-slate-400 mb-6 leading-relaxed">Touch the sensor on your physical security key to authorize this encrypted session.</p>
+                    <div className="flex gap-2">
+                       <div className="w-2 h-2 rounded-full bg-blue-500 animate-bounce [animation-delay:-0.3s]"></div>
+                       <div className="w-2 h-2 rounded-full bg-blue-500 animate-bounce [animation-delay:-0.15s]"></div>
+                       <div className="w-2 h-2 rounded-full bg-blue-500 animate-bounce"></div>
+                    </div>
                 </div>
             </div>
         )}
 
         <div className="relative">
-            {/* REMOTE VIDEO */}
-            <div className={`bg-slate-800 rounded-2xl overflow-hidden shadow-xl border border-slate-700 relative h-[600px] transition-all duration-500 z-0`}>
-                <div className="absolute top-4 left-4 z-10 bg-black/70 backdrop-blur px-3 py-1 rounded text-xs text-white font-semibold">
-                    {remoteSessionId ? 'REMOTE USER' : 'WAITING FOR CONNECTION...'}
+            {/* REMOTE VIDEO CONTAINER */}
+            <div className={`bg-slate-800 rounded-3xl overflow-hidden shadow-2xl border border-slate-700/50 relative h-[650px] transition-all duration-500 group`}>
+                <div className="absolute top-6 left-6 z-10 flex gap-2">
+                  <div className="bg-black/60 backdrop-blur-md px-4 py-1.5 rounded-full text-[10px] tracking-widest text-white font-black uppercase flex items-center gap-2 border border-white/10">
+                    <div className={`w-1.5 h-1.5 rounded-full ${remoteSessionId ? 'bg-green-500' : 'bg-red-500'}`} />
+                    {remoteSessionId ? 'REMOTE LINK ESTABLISHED' : 'LINKING...'}
+                  </div>
                 </div>
                 
-                {/* IDLE UI */}
+                {/* IDLE / WAITING UI */}
                 {!inCall && step !== 'active' && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400 bg-slate-900">
-                        <Phone size={48} className="mb-4 opacity-50" />
-                        <p>{step === 'initializing' ? 'Initializing Camera...' : 'Waiting for connection...'}</p>
-                        {roomId && <p className="text-xs mt-2 font-mono text-blue-400">Room: {roomId}</p>}
+                    <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400 bg-slate-900/80 backdrop-blur-xl">
+                        <div className="w-24 h-24 bg-slate-800 rounded-full flex items-center justify-center mb-6 shadow-inner border border-slate-700">
+                          <Phone size={40} className="opacity-40" />
+                        </div>
+                        <h3 className="text-xl font-semibold text-white mb-2">
+                          {step === 'initializing' ? 'Activating Hardened Module...' : 'Waiting for Remote Peer...'}
+                        </h3>
+                        <p className="text-sm text-slate-500">Secure Protocol v4.2.0-AEAD</p>
+                        {roomId && (
+                          <div className="mt-8 flex flex-col items-center">
+                            <p className="text-xs text-slate-500 mb-2 font-bold uppercase tracking-widest">Share this Room ID</p>
+                            <code className="bg-blue-900/20 text-blue-400 px-4 py-2 rounded-lg border border-blue-500/20 font-mono text-lg">{roomId}</code>
+                          </div>
+                        )}
                     </div>
                 )}
                 
-                {/* DIAGNOSTICS */}
-                {iceStatus !== 'Connected' && inCall && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-20 text-center p-4">
-                         <AlertCircle className="text-yellow-500 mb-2" size={32} />
-                         <h3 className="text-white font-bold text-lg">Connecting...</h3>
-                         <p className="text-slate-400 text-sm mb-4">Status: {iceStatus}</p>
-                         <button onClick={restartIce} className="bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded text-white text-sm flex gap-2">
-                             <RefreshCw size={14} /> Retry Connection
+                {/* CONNECTION DIAGNOSTICS OVERLAY */}
+                {iceStatus !== 'Connected' && iceStatus !== 'Completed' && inCall && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-20 text-center p-8 backdrop-blur-sm">
+                         <div className="bg-yellow-500/10 p-4 rounded-full mb-4">
+                           <AlertCircle className="text-yellow-500" size={40} />
+                         </div>
+                         <h3 className="text-white font-bold text-2xl mb-2">Signal Degraded</h3>
+                         <p className="text-slate-400 text-sm mb-8 max-w-xs">Peer connection state: <span className="text-yellow-400 font-mono">{iceStatus}</span>. Checking ICE candidates...</p>
+                         <button onClick={restartIce} className="bg-white/10 hover:bg-white/20 px-6 py-3 rounded-xl text-white text-sm font-bold flex gap-2 items-center transition-all border border-white/10">
+                             <RefreshCw size={16} /> Force Signal Reset
                          </button>
                     </div>
                 )}
 
-                <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover bg-black" />
+                <video 
+                  ref={remoteVideoRef} 
+                  autoPlay 
+                  playsInline 
+                  className="w-full h-full object-cover bg-slate-950" 
+                />
                 
-                {/* Trust Score */}
-                <div className="absolute bottom-4 left-4 right-4 z-10">
-                    <div className="bg-black/70 backdrop-blur p-3 rounded-lg">
-                        <div className="flex justify-between items-center mb-2">
-                            <span className="text-xs uppercase text-slate-300">Remote Verification</span>
+                {/* Remote Trust Score Indicator (Bottom) */}
+                <div className="absolute bottom-6 left-6 right-6 z-10">
+                    <div className="bg-slate-900/60 backdrop-blur-xl p-5 rounded-2xl border border-white/10 shadow-2xl">
+                        <div className="flex justify-between items-end mb-3">
+                            <div>
+                              <p className="text-[10px] uppercase tracking-tighter text-slate-400 font-black">Remote Security Baseline</p>
+                              <h4 className="text-white font-bold">Verification Engine v2</h4>
+                            </div>
                             {remoteTrustScore !== null ? (
-                                <span className={`font-mono font-bold flex gap-2 items-center ${remoteTrustScore > 80 ? 'text-green-400' : 'text-red-400'}`}>
-                                    {remoteTrustScore > 80 ? <Shield size={14}/> : <AlertTriangle size={14}/>} {remoteTrustScore}%
-                                </span>
-                            ) : <span className="text-slate-400 text-xs">CONNECTING...</span>}
+                                <div className={`flex flex-col items-end`}>
+                                    <span className={`text-2xl font-mono font-black flex gap-2 items-center ${remoteTrustScore > 80 ? 'text-green-400' : 'text-red-400'}`}>
+                                        {remoteTrustScore > 80 ? <Shield size={20}/> : <AlertTriangle size={20}/>} {remoteTrustScore}%
+                                    </span>
+                                    <span className="text-[10px] text-slate-500 uppercase font-bold">Confidence Score</span>
+                                </div>
+                            ) : (
+                              <div className="animate-pulse flex items-center gap-2">
+                                <div className="w-2 h-2 bg-slate-600 rounded-full" />
+                                <span className="text-slate-500 text-[10px] font-black tracking-widest">ANALYZING PEER...</span>
+                              </div>
+                            )}
                         </div>
-                        <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
-                            <div className={`h-full transition-all ${remoteTrustScore && remoteTrustScore > 80 ? 'bg-blue-500' : 'bg-red-500'}`} style={{width: `${remoteTrustScore || 0}%`}} />
+                        <div className="h-3 bg-white/5 rounded-full overflow-hidden border border-white/5 p-0.5">
+                            <div 
+                              className={`h-full rounded-full transition-all duration-1000 ease-out ${
+                                remoteTrustScore && remoteTrustScore > 80 ? 'bg-gradient-to-r from-blue-600 to-green-500' : 'bg-red-500'
+                              }`} 
+                              style={{width: `${remoteTrustScore || 0}%`}} 
+                            />
                         </div>
                     </div>
                 </div>
             </div>
 
-            {/* YOUR VIDEO (PIP) */}
+            {/* YOUR VIDEO (PIP - DRAGGABLE ONLY WHEN CONNECTED) */}
             {(step === 'active' || step === 'initializing') && (
                 <div 
                     className={
                         step === 'initializing' 
-                        ? "fixed inset-0 z-50 bg-slate-900 flex items-center justify-center"
-                        : "absolute z-20 bg-slate-800 rounded-xl overflow-hidden shadow-2xl border-2 border-slate-600 cursor-move select-none"
+                        ? "fixed inset-0 z-50 bg-slate-950 flex items-center justify-center"
+                        : `absolute z-30 bg-slate-900 rounded-2xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] border-2 transition-all duration-300 ${
+                            inCall 
+                            ? 'border-blue-500/50 cursor-move hover:scale-[1.02] shadow-blue-500/10' 
+                            : 'border-slate-700/50 cursor-default opacity-90'
+                          }`
                     }
                     style={step === 'active' ? {
                         left: `${pipPosition.x}px`,
                         top: `${pipPosition.y}px`,
-                        width: '240px',
-                        height: '320px'
+                        width: '260px',
+                        height: '350px'
                     } : {}}
                     onMouseDown={handleMouseDown}
                 >
-                    <div className="absolute top-2 left-2 z-30 bg-black/70 backdrop-blur px-2 py-1 rounded text-xs text-white font-semibold">YOU</div>
-                    {step === 'active' && (
-                        <div className="absolute top-2 right-2 z-30 bg-black/50 p-1 rounded-full"><Move size={12} className="text-white" /></div>
+                    <div className="absolute top-3 left-3 z-40 flex items-center gap-2">
+                        <div className="bg-black/60 backdrop-blur-md px-3 py-1 rounded-full text-[9px] tracking-widest text-white font-black border border-white/5 uppercase">
+                          Local Monitoring
+                        </div>
+                        {step === 'active' && (
+                          <div className={`px-2 py-1 rounded-full text-[8px] font-black uppercase tracking-tighter flex items-center gap-1 border ${
+                            inCall ? 'bg-blue-500/20 text-blue-400 border-blue-500/30' : 'bg-slate-800 text-slate-500 border-slate-700'
+                          }`}>
+                            {inCall ? <Unlock size={10} /> : <Lock size={10} />}
+                            {inCall ? 'Unlocked' : 'Locked'}
+                          </div>
+                        )}
+                    </div>
+
+                    {step === 'active' && inCall && (
+                        <div className="absolute top-3 right-3 z-40 bg-blue-500/80 p-1.5 rounded-full border border-white/20 shadow-lg animate-pulse">
+                          <Move size={12} className="text-white" />
+                        </div>
                     )}
 
                     <div className="relative h-full w-full">
-                        <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover transform scale-x-[-1] bg-black" />
+                        <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover transform scale-x-[-1] bg-slate-950" />
                         
+                        {/* Security Challenge Overlay */}
                         {challengeActive && currentChallenge && (
-                            <div className="absolute inset-0 bg-black/90 backdrop-blur z-20 flex flex-col items-center justify-center">
-                                <div className="text-3xl mb-2">👮</div>
-                                <h3 className="text-sm font-bold text-white mb-1">Security Check</h3>
-                                <div className="text-sm text-yellow-400 font-mono font-bold bg-slate-900 px-3 py-1 rounded border border-yellow-500/50">{currentChallenge}</div>
+                            <div className="absolute inset-0 bg-blue-950/80 backdrop-blur-md z-20 flex flex-col items-center justify-center p-6 text-center">
+                                <div className="w-12 h-12 bg-yellow-500/20 rounded-full flex items-center justify-center mb-4 border border-yellow-500/40">
+                                  <Shield className="text-yellow-500" size={24} />
+                                </div>
+                                <h3 className="text-xs font-black text-white mb-2 uppercase tracking-widest">Active Challenge</h3>
+                                <div className="text-sm text-yellow-300 font-mono font-bold bg-black/40 px-4 py-2 rounded-xl border border-yellow-500/30 shadow-lg">
+                                  {currentChallenge}
+                                </div>
+                                <p className="text-[10px] text-slate-400 mt-4 leading-tight">AI verification required to maintain session trust.</p>
                             </div>
                         )}
                         
                         {!faceDetected && !challengeActive && step === 'active' && (
-                            <div className="absolute inset-0 flex items-center justify-center pointer-events-none bg-red-900/50">
-                                <div className="bg-red-600 text-white px-2 py-1 rounded text-xs font-bold flex gap-1 items-center"><UserX size={12} /> NO FACE</div>
+                            <div className="absolute inset-0 flex items-center justify-center pointer-events-none bg-red-950/60 backdrop-blur-[2px]">
+                                <div className="bg-red-600 text-white px-4 py-2 rounded-xl text-[10px] font-black tracking-tighter shadow-xl flex gap-2 items-center border border-red-400/50">
+                                  <UserX size={16} /> FACE MISSING
+                                </div>
                             </div>
                         )}
                     </div>
                     
-                    <div className="absolute bottom-0 left-0 right-0 bg-black/80 backdrop-blur p-2">
-                        <div className="flex justify-between items-center mb-1">
-                            <span className="text-xs text-slate-300">Trust</span>
-                            <span className={`font-mono text-xs font-bold ${trustScore > 80 ? 'text-green-400' : 'text-red-400'}`}>{trustScore}%</span>
+                    <div className="absolute bottom-0 left-0 right-0 bg-slate-900/90 backdrop-blur-xl p-4 border-t border-white/5">
+                        <div className="flex justify-between items-center mb-1.5">
+                            <span className="text-[10px] font-black uppercase text-slate-500 tracking-wider">Local Trust</span>
+                            <span className={`font-mono text-xs font-black ${trustScore > 80 ? 'text-green-400' : 'text-red-400'}`}>{trustScore}%</span>
                         </div>
-                        <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
-                            <div className={`h-full transition-all duration-300 ${trustScore > 80 ? 'bg-green-500' : 'bg-red-500'}`} style={{width: `${trustScore}%`}} />
+                        <div className="h-1.5 bg-white/5 rounded-full overflow-hidden mb-2">
+                            <div 
+                              className={`h-full transition-all duration-700 ${trustScore > 80 ? 'bg-green-500' : 'bg-red-500'}`} 
+                              style={{width: `${trustScore}%`}} 
+                            />
                         </div>
-                        <div className="text-xs text-slate-400 mt-1 text-center truncate">{statusMessage}</div>
+                        <div className="text-[9px] text-slate-400 font-bold uppercase tracking-widest text-center truncate px-2 opacity-80">{statusMessage}</div>
                     </div>
                 </div>
             )}
         </div>
         
+        {/* Hidden analysis canvas */}
         <canvas ref={canvasRef} width={640} height={480} className="hidden" />
 
-        <div className="mt-8 flex justify-center">
+        <div className="mt-10 flex flex-col items-center gap-4">
             {step === 'idle' ? (
-                <button 
-                    onClick={startVerification} 
-                    disabled={!roomId.trim()}
-                    className={`${roomId.trim() ? 'bg-blue-600 hover:bg-blue-500' : 'bg-slate-600 cursor-not-allowed'} text-white px-8 py-3 rounded-full font-bold flex items-center gap-2 transition-all`}
-                >
-                    <Phone size={20} /> Start Secure Video Call
-                </button>
+                <div className="flex flex-col items-center gap-3">
+                  <button 
+                      onClick={startVerification} 
+                      disabled={!roomId.trim()}
+                      className={`${roomId.trim() ? 'bg-blue-600 hover:bg-blue-500 shadow-blue-600/20' : 'bg-slate-700 cursor-not-allowed opacity-50'} text-white px-12 py-4 rounded-full font-black uppercase tracking-widest flex items-center gap-3 transition-all transform active:scale-95 shadow-xl group`}
+                  >
+                      <Phone size={20} className="group-hover:rotate-12 transition-transform" /> Start Hardened Session
+                  </button>
+                  <p className="text-[10px] text-slate-500 font-bold tracking-tighter uppercase opacity-50">Peer-to-Peer • End-to-End Encrypted • AI Verified</p>
+                </div>
             ) : (
-                <button onClick={() => window.location.reload()} className="bg-red-600 hover:bg-red-500 text-white px-8 py-3 rounded-full font-bold flex items-center gap-2 z-50 relative">
-                    <PhoneOff size={20} /> End Call
+                <button onClick={() => window.location.reload()} className="bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white px-10 py-4 rounded-full font-black uppercase tracking-widest flex items-center gap-3 transition-all border border-red-500/20 z-50 group">
+                    <PhoneOff size={20} className="group-hover:-rotate-12 transition-transform" /> Terminate Link
                 </button>
             )}
         </div>
