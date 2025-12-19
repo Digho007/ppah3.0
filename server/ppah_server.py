@@ -252,8 +252,11 @@ class PPAHSession:
         self.segment_count = 0
         self.hash_chain = []
         self.freeze_reason = None
+        # NEW: Track exact score (defaults to 100)
+        self.last_trust_score = 100 
 
     def add_hash(self, segment_id: int, hash_value: str, trust_score: int, signature: str):
+        self.last_trust_score = trust_score # Update on every heartbeat
         if trust_score < 40:
             self.status = "frozen"
             self.freeze_reason = f"Low Trust Score: {trust_score}"
@@ -283,6 +286,8 @@ def load_session(session_id: str):
         s = PPAHSession(d['session_id'], d['email'], d['webauthn_id'], d['session_key'])
         s.status = d['status']
         s.freeze_reason = d.get('freeze_reason')
+        # Load the trust score, default to 100 if old session format
+        s.last_trust_score = d.get('last_trust_score', 100) 
         return s
     return None
 
@@ -323,7 +328,12 @@ async def verify_hash(request: VerifyHashRequest):
 async def get_security_report(session_id: str):
     session = load_session(session_id)
     if not session: raise HTTPException(status_code=404)
-    return {'status': session.status, 'freeze_reason': session.freeze_reason, 'auth_method': 'WebAuthn+PPAH'}
+    return {
+        'status': session.status, 
+        'score': session.last_trust_score, # Return exact score
+        'freeze_reason': session.freeze_reason, 
+        'auth_method': 'WebAuthn+PPAH'
+    }
 
 if __name__ == "__main__":
     import uvicorn

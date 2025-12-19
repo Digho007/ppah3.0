@@ -2,7 +2,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { 
   Shield, Phone, PhoneOff, UserX, Fingerprint, PlusCircle, 
-  Move, Signal, RefreshCw, AlertCircle, AlertTriangle, Lock, Unlock
+  Move, RefreshCw, AlertCircle, AlertTriangle, Lock, Unlock
 } from 'lucide-react';
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
@@ -399,6 +399,7 @@ const PPAHVerification = () => {
   const initializeCamera = async () => {
     setStatusMessage('Initializing Camera...');
     try {
+      // Audio ENABLED here:
       const stream = await navigator.mediaDevices.getUserMedia({ 
           video: { width: 640, height: 480 },
           audio: true 
@@ -442,7 +443,7 @@ const PPAHVerification = () => {
 
   // --- DRAGGING HANDLERS ---
   const handleMouseDown = (e: React.MouseEvent) => {
-    // UPDATED: Draggable only if step is active AND we are inCall (connected to peer)
+    // Draggable only if step is active AND we are inCall (connected to peer)
     if (step !== 'active' || !inCall) return; 
     setIsDragging(true);
     setDragOffset({ x: e.clientX - pipPosition.x, y: e.clientY - pipPosition.y });
@@ -470,7 +471,14 @@ const PPAHVerification = () => {
               const res = await fetch(`${getBackendUrl()}/api/session/${remoteSessionId}/security-report`);
               if (res.ok) {
                   const data = await res.json();
-                  setRemoteTrustScore(data.status === 'active' ? 100 : 0);
+                  
+                  // NEW: Use the real score if provided by server
+                  if (data.score !== undefined) {
+                      setRemoteTrustScore(data.score);
+                  } else {
+                      // Fallback for older sessions
+                      setRemoteTrustScore(data.status === 'active' ? 100 : 0);
+                  }
               }
           } catch (e) {}
       }, 2000); 
