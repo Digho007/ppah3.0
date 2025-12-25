@@ -1,40 +1,48 @@
 # PPAH 3.0: Privacy-Preserving Adaptive Hashing with Remote Sessions
 
-**PPAH 3.0** is a secure, privacy-first video verification platform designed to prevent deepfakes and unauthorized access in remote communications. Unlike PPAH 2.0, which focused on local verification, **PPAH 3.0 introduces real-time Remote Sessions**, allowing two parties to establish a cryptographically secured video call where user integrity is continuously monitored.
+**PPAH 3.0** is a zero-trust, privacy-first video verification platform designed to secure remote sessions against deepfakes, virtual camera injection, and unauthorized access.
 
-> **USP:** PPAH implements a **Zero-Trust Architecture**. It anchors digital identity to physical hardware (WebAuthn) and continuously signs video frames based on biometric trust scores, effectively rendering virtual camera injections and deepfakes useless.
+Unlike traditional conferencing tools that verify identity only once at login, **PPAH 3.0 enforces Continuous Authentication**. It combines hardware-anchored identity (WebAuthn), Edge AI (MediaPipe), and a novel **Adaptive Hashing Protocol** to cryptographically bind video frame integrity to real-time user behavior.
 
-## 🚀 What's New in v3.0?
+> **Core Innovation:** The system implements **Adaptive Privacy Blurring**. If the biometric trust score drops due to deepfake artifacts or liveness failure, the remote video feed automatically blurs to protect the viewer, and the hashing interval accelerates (5x) to rigorously re-verify the identity.
 
-* **Remote Session Support:** Users can now join secure "Rooms" via WebRTC to conduct verified video calls.
-* **Draggable PIP Interface:** A Zoom-style UI with a draggable local video (Picture-in-Picture) and full-screen remote view.
-* **Adaptive Trust Scoring:** Real-time monitoring that adjusts security checks based on user behavior (e.g., looking away, leaving the camera).
-* **Deepfake Resistance:** Cryptographic signing of every video frame ensures that the video feed cannot be hijacked by OBS or virtual cameras.
+---
 
-## 🌟 Key Features
+## 🚀 Key Features & Security Mechanics
 
-### 1. Hardware-Anchored Identity (WebAuthn)
+### 1. 🛡️ Zero-Trust Enforcement
 
-* **No Passwords:** Login requires a physical FIDO2 key, Fingerprint, or FaceID.
-* **Anti-Phishing:** Credentials are bound to the specific domain, making phishing attacks impossible.
+* **Virtual Camera Blockade:** The system actively scans media driver labels. If software like **OBS, ManyCam, or Virtual Cables** is detected, camera access is immediately revoked.
+* **Auto-Termination:** If the Trust Score hits **0%** (Local or Remote), the session is instantly killed.
 
-### 2. Adaptive Hashing & Integrity
+### 2. 👁️ Adaptive Privacy Blur
 
-* **Dynamic Signatures:** Every video frame is hashed and signed locally. The signature is valid *only* if the user's current Trust Score is high.
-* **Liveness Challenges:** If the Trust Score drops (e.g., < 60%), the system pauses the stream and forces a challenge (e.g., "Turn Head Left").
+* **Trust-Based Visibility:**
+* **Score > 60%:** Video is Clear (Trusted).
+* **Score < 60%:** Video is **Blurred** (Untrusted). This neutralizes the visual impact of deepfakes.
 
-### 3. Privacy-Preserving Monitoring
 
-* **Local Processing:** Biometric analysis (Face Detection, Head Pose) runs entirely in the browser (Client-Side).
-* **Minimal Data Leakage:** The server receives hashes and signatures, not raw biometric data.
+* **Self-Healing:** Once the user passes a randomized Liveness Challenge (e.g., "Turn Head Left"), the score recovers, and the video unblurs.
+
+### 3. ⚡ Environmental Heuristics
+
+The hashing engine is not static. It monitors the environment in real-time:
+
+* **Baseline:** Hashes 1 frame every **1000ms**.
+* **Adaptive Trigger:** If **Scene Brightness** shifts by >10% or **Network Stability** drops, the system assumes a potential attack (e.g., camera swap).
+* **Reaction:** The hashing interval drops to **200ms**, forcing the client to prove identity 5x faster.
+
+### 4. 🔐 Hardware-Anchored Identity
+
+* **WebAuthn/FIDO2:** Login is strictly bound to physical hardware (Fingerprint, FaceID, YubiKey). Passwords are eliminated to prevent credential sharing.
 
 ---
 
 ## 🛠️ Tech Stack
 
-* **Frontend:** Next.js (React), Tailwind CSS, MediaPipe (Biometrics), SimpleWebAuthn (FIDO2).
-* **Backend:** FastAPI (Python), SQLite (Database), WebSockets (Signaling).
-* **Security:** WebAuthn (FIDO2), HMAC-SHA256 (Frame Signing), WebRTC (P2P Encryption).
+* **Frontend:** Next.js 14 (React), Tailwind CSS, MediaPipe (Edge AI).
+* **Backend:** FastAPI (Python), SQLite, WebSockets (Real-time Signaling).
+* **Security:** HMAC-SHA256 (Packet Signing), WebAuthn (Auth), WebRTC (P2P Encryption).
 
 ---
 
@@ -42,9 +50,9 @@
 
 ### Prerequisites
 
-* Python 3.9+
-* Node.js 16+
-* Ngrok (Required for WebAuthn on mobile/remote testing)
+* Python 3.10+
+* Node.js 18+
+* **Ngrok** (Essential for WebAuthn on mobile/remote devices)
 
 ### 1. Backend Setup (FastAPI)
 
@@ -63,7 +71,7 @@ source venv/bin/activate
 pip install fastapi uvicorn webauthn[fastapi]
 
 # Start Server
-# NOTE: Update NGROK_DOMAIN in server/ppah_server.py first!
+# ⚠️ IMPORTANT: Update NGROK_DOMAIN in server/ppah_server.py first!
 python -m uvicorn server.ppah_server:app --reload --host 0.0.0.0 --port 8000
 
 ```
@@ -85,27 +93,33 @@ npm run dev
 
 ### 3. Expose to Internet (Ngrok)
 
-WebAuthn requires a secure context (HTTPS) or localhost. To test on mobile:
+WebAuthn requires a secure context (HTTPS) to access biometrics on mobile devices.
 
 ```bash
 ngrok http 3000
 
 ```
 
-*Copy the forwarding URL (e.g., `https://abcd-123.ngrok-free.app`) and update `NGROK_DOMAIN` in `server/ppah_server.py`.*
+* **Step A:** Copy the forwarding URL (e.g., `https://your-app.ngrok-free.app`).
+* **Step B:** Update the `NGROK_DOMAIN` variable in `server/ppah_server.py`.
+* **Step C:** Restart the Python backend.
 
 ---
 
-## 📱 Usage Guide
+## 📱 User Guide
 
-1. **Open the App:** Go to your Ngrok URL on your phone or desktop.
-2. **Register Key:** Click **"Register Key"**. Use your Fingerprint/FaceID when prompted.
-3. **Join a Room:** Enter a unique Room Name (e.g., `Exam-Room-1`) and click **"Start Secure Video Call"**.
-4. **Verification:** The system will verify your biometric key and initialize the camera.
-5. **The Session:**
-* **High Trust (100%):** Call proceeds normally.
-* **Low Trust (<60%):** You will be asked to perform a head movement challenge.
-* **Zero Trust (0%):** Session is flagged or terminated.
+1. **Access:** Open the Ngrok HTTPS URL on two devices (e.g., Laptop and Phone).
+2. **Register:** Click **"Register Security Key"** on both devices. Authenticate using TouchID/FaceID.
+3. **Connect:**
+* **User A:** Enters Room ID (e.g., `Room101`) -> Clicks "Start Video Call".
+* **User B:** Enters Room ID (`Room101`) -> Clicks "Start Video Call".
+
+
+4. **The Secure Session:**
+* The timer will only start when the connection is established.
+* **Try to attack:** Cover your face or look away.
+* **Observe:** Your Trust Score drops. On the *other* device, your video will **blur** automatically.
+* **Recover:** Perform the head movement challenge to restore the clear video feed.
 
 
 
@@ -113,28 +127,20 @@ ngrok http 3000
 
 ## ⚠️ Troubleshooting
 
-**"User Not Found" Error:**
+**"Session Terminated: Remote Peer Untrusted"**
 
-* You must click **"Register Key"** *before* trying to start a call. The system needs to save your public key first.
+* This is not a bug; it is a feature. The remote peer's score hit 0% because they failed the liveness check or blocked their camera for too long. Refresh to reconnect.
 
-**"Hardware Authentication" Fails Immediately:**
+**Timer isn't starting**
 
-* Check your `server/ppah_server.py`. Ensure `NGROK_DOMAIN` matches your browser URL **exactly** (no `https://` prefix in the variable).
-* Ensure you are accessing via HTTPS (Ngrok), not HTTP.
+* The timer is strictly synchronized. It waits for the **Peer Connection (WebRTC)** to complete. Ensure both devices are on the same Room ID and `iceStatus` says "Connected".
 
-**Database Errors (sqlite3):**
+**Video is constantly blurry**
 
-* If you changed the schema recently, delete the old database file:
-```bash
-rm server/ppah_enterprise.db
-
-```
-
-
-The server will recreate it automatically on restart.
+* Check the server logs. If the server considers the session "Frozen" (Score < 40%), it will enforce the blur. Perform the liveness challenge (Head Yaw) to unfreeze.
 
 ---
 
 ## 📄 License
 
-This project is proprietary software developed for high-security verification research. Unauthorized copying or distribution is prohibited.
+**Proprietary Research Software.** Developed for the "Privacy-Preserving Adaptive Hashing" academic study. Unauthorized distribution is prohibited.
