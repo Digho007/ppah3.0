@@ -1,8 +1,7 @@
 "use client";
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { 
-  Shield, Phone, Mic, MicOff, 
-  Lock, Unlock, Signal, AlertTriangle, 
+  Shield, Mic, MicOff, Lock, Signal, AlertTriangle, 
   PhoneOff, Fingerprint, PlusCircle, UserX, Video
 } from 'lucide-react';
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
@@ -12,15 +11,13 @@ import { startRegistration, startAuthentication } from '@simplewebauthn/browser'
 if (typeof window !== 'undefined') {
   const originalError = console.error;
   const originalInfo = console.info;
-
   console.error = (...args) => {
     if (/NotAllowedError/.test(args[0]?.toString())) return;
-    if (/Created TensorFlow Lite XNNPACK delegate for CPU/.test(args[0]?.toString())) return;
+    if (/Created TensorFlow Lite XNNPACK/.test(args[0]?.toString())) return;
     originalError.call(console, ...args);
   };
-
   console.info = (...args) => {
-    if (/Created TensorFlow Lite XNNPACK delegate for CPU/.test(args[0]?.toString())) return;
+    if (/Created TensorFlow Lite XNNPACK/.test(args[0]?.toString())) return;
     originalInfo.call(console, ...args);
   };
 }
@@ -40,8 +37,8 @@ const PPAHVerification = () => {
   // ROOM & CALL STATE
   const [roomId, setRoomId] = useState('');
   const [callDuration, setCallDuration] = useState(0);
-  const [inCall, setInCall] = useState(false); // Local session active
-  const [isRemoteConnected, setIsRemoteConnected] = useState(false); // Remote peer connected
+  const [inCall, setInCall] = useState(false);
+  const [isRemoteConnected, setIsRemoteConnected] = useState(false);
   const [showControls, setShowControls] = useState(true);
   
   // DIAGNOSTICS
@@ -89,19 +86,11 @@ const PPAHVerification = () => {
 
   useEffect(() => { trustScoreRef.current = trustScore; }, [trustScore]);
 
-  // --- PPAH ENFORCEMENT LOGIC ---
+  // --- ENFORCEMENT ---
   useEffect(() => {
     if (!inCall) return;
-
-    // 1. Local Enforcement
-    if (trustScore === 0) {
-        terminateSession("Security Violation: Local Trust Lost");
-    }
-
-    // 2. Remote Enforcement
-    if (remoteTrustScore !== null && remoteTrustScore === 0) {
-        terminateSession("Security Violation: Remote Peer Untrusted");
-    }
+    if (trustScore === 0) terminateSession("Security Violation: Local Trust Lost");
+    if (remoteTrustScore !== null && remoteTrustScore === 0) terminateSession("Security Violation: Remote Peer Untrusted");
   }, [trustScore, remoteTrustScore, inCall]);
 
   const terminateSession = (reason: string) => {
@@ -109,7 +98,7 @@ const PPAHVerification = () => {
       window.location.reload();
   };
 
-  // --- INITIAL LAYOUT SETUP ---
+  // --- INITIAL LAYOUT ---
   useEffect(() => {
     if (typeof window !== 'undefined') {
       setPipPosition({ x: window.innerWidth - 160, y: 80 });
@@ -126,7 +115,7 @@ const PPAHVerification = () => {
     return '';
   };
 
-  // --- CONTROLS VISIBILITY LOGIC ---
+  // --- CONTROLS VISIBILITY ---
   const resetControlsTimer = useCallback(() => {
     setShowControls(true);
     if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
@@ -209,7 +198,6 @@ const PPAHVerification = () => {
     if (monitoringRef.current) clearInterval(monitoringRef.current);
   };
 
-  // --- 3. HARDWARE TOGGLES ---
   const toggleMute = () => {
     if (streamRef.current) {
       const audioTrack = streamRef.current.getAudioTracks()[0];
@@ -255,6 +243,12 @@ const PPAHVerification = () => {
     pc.oniceconnectionstatechange = () => {
         const state = pc.iceConnectionState;
         setIceStatus(state.charAt(0).toUpperCase() + state.slice(1));
+        
+        if (state === 'connected' || state === 'completed') {
+            setIsRemoteConnected(true);
+        } else if (state === 'disconnected' || state === 'failed') {
+            setIsRemoteConnected(false);
+        }
     };
 
     streamRef.current.getTracks().forEach(track => pc.addTrack(track, streamRef.current!));
@@ -262,7 +256,6 @@ const PPAHVerification = () => {
     pc.ontrack = (event) => { 
         if (remoteVideoRef.current) {
             remoteVideoRef.current.srcObject = event.streams[0];
-            // START TIMER TRIGGER: Video has started flowing
             setIsRemoteConnected(true);
         }
     };
@@ -279,6 +272,14 @@ const PPAHVerification = () => {
     
     socketRef.current.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
+        
+        // --- NEW: HANDLE PEER LEFT ---
+        if (msg.type === 'peer_left') {
+            setIsRemoteConnected(false); // STOP TIMER INSTANTLY
+            setRemoteTrustScore(null);
+            if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+        }
+
         if (msg.type === 'identify') setRemoteSessionId(msg.sessionId);
         
         if (msg.type === 'offer') {
@@ -309,11 +310,11 @@ const PPAHVerification = () => {
     };
   };
 
-  // --- 5. CALL TIMER (STARTS ON CONNECT) ---
+  // --- 5. TIMER LOGIC (STRICT SYNC) ---
   useEffect(() => {
     let timer: NodeJS.Timeout;
-    // Timer only starts when remote peer is actually connected
     if (isRemoteConnected) {
+        setCallDuration(0);
         timer = setInterval(() => {
             setCallDuration(prev => prev + 1);
         }, 1000);
@@ -393,7 +394,7 @@ const PPAHVerification = () => {
                     setFaceDetected(false);
                     noFaceCounter.current += 1;
                     if (noFaceCounter.current > 3 && !challengeActiveRef.current) {
-                        handleSecurityEvent("No Face", 10);
+                        handleSecurityEvent("No Face", 15);
                     }
                 }
             } catch (e) {}
@@ -579,7 +580,8 @@ const PPAHVerification = () => {
     if (remoteSessionId) {
       const interval = setInterval(async () => {
           try {
-              const res = await fetch(`${getBackendUrl()}/api/session/${remoteSessionId}/security-report`);
+              // Add timestamp to bust cache
+              const res = await fetch(`${getBackendUrl()}/api/session/${remoteSessionId}/security-report?t=${Date.now()}`);
               if (res.ok) {
                   const data = await res.json();
                   if (data.score !== undefined) {
@@ -589,7 +591,7 @@ const PPAHVerification = () => {
                   }
               }
           } catch (e) {}
-      }, 2000); 
+      }, 1000); 
       return () => clearInterval(interval);
     }
   }, [remoteSessionId]);
@@ -602,9 +604,9 @@ const PPAHVerification = () => {
         ref={remoteVideoRef} 
         autoPlay 
         playsInline 
-        className="absolute inset-0 w-full h-full object-cover z-0 transition-all duration-500" 
+        className="absolute inset-0 w-full h-full object-cover z-0 transition-all duration-300 ease-in-out" 
         style={{
-            filter: remoteTrustScore !== null && remoteTrustScore < 60 ? 'blur(15px)' : 'none'
+            filter: remoteTrustScore !== null && remoteTrustScore < 60 ? 'blur(20px)' : 'none'
         }}
       />
       
@@ -616,11 +618,10 @@ const PPAHVerification = () => {
                  <h2 className="text-lg font-semibold drop-shadow-md">{roomId || "PPAH Secure"}</h2>
                  {inCall && <div className="bg-blue-600/20 px-2 py-0.5 rounded text-[10px] text-blue-400 font-bold border border-blue-500/30">ENCRYPTED</div>}
               </div>
-              {/* TIMER ONLY SHOWS IF REMOTE IS CONNECTED */}
               {isRemoteConnected && <span className="text-sm font-medium opacity-80">{formatTime(callDuration)}</span>}
             </div>
 
-            {/* Right: Security Badges (SUBTLE) */}
+            {/* Right: Security Badges */}
             {inCall && (
                 <div className="flex flex-col items-end gap-1">
                    {remoteTrustScore !== null && (
@@ -696,7 +697,7 @@ const PPAHVerification = () => {
         </div>
       </div>
 
-      {/* 5. IDLE / WAITING OVERLAY (FIXED INPUT & BUTTON) */}
+      {/* 5. IDLE / WAITING OVERLAY */}
       {step === 'idle' && (
          <div className="absolute inset-0 flex flex-col items-center justify-center z-10 pointer-events-none">
             <div className="bg-black/40 backdrop-blur-xl p-6 rounded-2xl border border-white/10 text-center pointer-events-auto shadow-2xl">
