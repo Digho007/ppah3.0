@@ -144,3 +144,13 @@ ngrok http 3000
 ## 📄 License
 
 **Proprietary Research Software.** Developed for the "Privacy-Preserving Adaptive Hashing" academic study. Unauthorized distribution is prohibited.
+
+
+## 👥 Authors & Contributors
+
+* **Jeremiah Dighomanor** - *Lead Researcher & Developer* - [jeremiahdighomanor@gmail.com]
+* **David Ogar** - *Research Associate / Co-Developer*
+* **Alex Omosigho** - *Research Associate / Co-Developer*
+* **Ndifreke Sam** - *Research Mentor*
+
+*Affiliation: Wale Lab Fellow*
