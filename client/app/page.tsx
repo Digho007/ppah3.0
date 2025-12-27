@@ -28,6 +28,9 @@ const formatTime = (seconds: number) => {
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 };
 
+// --- SECURITY CONFIGURATION ---
+const BANNED_DRIVERS = ['virtual', 'obs', 'manycam', 'loopback', 'vcam', 'droidcam'];
+
 const PPAHVerification = () => {
   // --- STATE ---
   const [step, setStep] = useState('idle');
@@ -75,7 +78,10 @@ const PPAHVerification = () => {
   const webAuthnCredRef = useRef<string | null>(null);
   const anchorBiometricRef = useRef<any | null>(null);
   const workerRef = useRef<Worker | null>(null);
+  
+  // CHANGED: monitoringRef is now for setTimeout, not setInterval
   const monitoringRef = useRef<NodeJS.Timeout | null>(null);
+  
   const trustScoreRef = useRef(trustScore); 
   const landmarkerRef = useRef<FaceLandmarker | null>(null);
   const challengeActiveRef = useRef(false);
@@ -195,7 +201,8 @@ const PPAHVerification = () => {
     streamRef.current?.getTracks().forEach(t => t.stop());
     if (socketRef.current) socketRef.current.close();
     if (peerConnection.current) peerConnection.current.close();
-    if (monitoringRef.current) clearInterval(monitoringRef.current);
+    // CHANGED: Use clearTimeout instead of clearInterval
+    if (monitoringRef.current) clearTimeout(monitoringRef.current);
   };
 
   const toggleMute = () => {
@@ -273,7 +280,6 @@ const PPAHVerification = () => {
     socketRef.current.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
         
-        // --- NEW: HANDLE PEER LEFT ---
         if (msg.type === 'peer_left') {
             setIsRemoteConnected(false); // STOP TIMER INSTANTLY
             setRemoteTrustScore(null);
@@ -371,16 +377,21 @@ const PPAHVerification = () => {
     challengeActiveRef.current = false;
   };
 
-  // --- 7. MONITORING LOOP ---
+  // --- 7. MONITORING LOOP (ADAPTIVE UPDATE) ---
   const startMonitoring = (activeSid: string) => {
     let seg = 1;
-    monitoringRef.current = setInterval(async () => {
+    let isRunning = true; 
+
+    // RECURSIVE LOOP FOR ADAPTIVE TIMING
+    const loop = async () => {
+        if (!isRunning) return; 
+
+        const startTime = Date.now();
         const video = videoRef.current;
         const canvas = canvasRef.current;
-        if (!video || !canvas) return;
-        const isReady = video.readyState >= 2 && video.videoWidth > 0;
-        
-        if (landmarkerRef.current && isReady) {
+
+        // Perform Checks if Video Ready
+        if (video && canvas && landmarkerRef.current && video.readyState >= 2) {
             try {
                 const results = landmarkerRef.current.detectForVideo(video, performance.now());
                 if (results.faceLandmarks.length > 0) {
@@ -398,36 +409,74 @@ const PPAHVerification = () => {
                     }
                 }
             } catch (e) {}
+
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            if (ctx) {
+                ctx.drawImage(video, 0, 0);
+                const imgData = ctx.getImageData(0,0,640,480);
+                if (seg === 1) workerRef.current?.postMessage({ type: 'GENERATE_ANCHOR', imageData: imgData });
+                else if (!challengeActiveRef.current) {
+                    workerRef.current?.postMessage({ type: 'ANALYZE_FRAME', imageData: imgData, anchorBiometric: anchorBiometricRef.current });
+                }
+                const hashBuf = await crypto.subtle.digest('SHA-256', imgData.data);
+                const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+                const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
+                await fetch(`${getBackendUrl()}/api/verify-hash`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ session_id: activeSid, segment_id: seg, hash: hashHex, trust_score: trustScoreRef.current, signature: sig })
+                });
+                seg++;
+            }
         }
 
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        if (ctx && isReady) {
-            ctx.drawImage(video, 0, 0);
-            const imgData = ctx.getImageData(0,0,640,480);
-            if (seg === 1) workerRef.current?.postMessage({ type: 'GENERATE_ANCHOR', imageData: imgData });
-            else if (!challengeActiveRef.current) {
-                workerRef.current?.postMessage({ type: 'ANALYZE_FRAME', imageData: imgData, anchorBiometric: anchorBiometricRef.current });
-            }
-            const hashBuf = await crypto.subtle.digest('SHA-256', imgData.data);
-            const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
-            const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
-            await fetch(`${getBackendUrl()}/api/verify-hash`, {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ session_id: activeSid, segment_id: seg, hash: hashHex, trust_score: trustScoreRef.current, signature: sig })
-            });
-            seg++;
+        // --- ADAPTIVE LOGIC ---
+        // If Trust is low OR Network is unstable -> Speed up to 200ms
+        let nextDelay = 1000;
+        if (trustScoreRef.current < 80 || iceStatus !== 'Connected') {
+            nextDelay = 200; // FAST MODE
         }
-    }, 1000); 
+
+        const processingTime = Date.now() - startTime;
+        const actualDelay = Math.max(0, nextDelay - processingTime);
+        
+        monitoringRef.current = setTimeout(loop, actualDelay);
+    };
+
+    loop(); // Start the loop
   };
 
-  // --- AUTH & INIT ---
+  // --- AUTH & INIT (UPDATED WITH BLOCKER) ---
   const initializeCamera = async () => {
     setStatusMessage('Init Camera...');
     try {
+      // 1. VIRTUAL CAMERA BLOCKADE
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoInputs = devices.filter(d => d.kind === 'videoinput');
+      
+      for (const device of videoInputs) {
+          const label = device.label.toLowerCase();
+          // Check for banned keywords in available devices
+          if (BANNED_DRIVERS.some(banned => label.includes(banned))) {
+              alert(`SECURITY ALERT: Virtual Camera Detected (${device.label}). Access Denied.`);
+              return false;
+          }
+      }
+
+      // 2. REQUEST STREAM
       const stream = await navigator.mediaDevices.getUserMedia({ 
           video: { width: 640, height: 480, facingMode: 'user' },
           audio: true 
       });
+
+      // 3. DOUBLE CHECK ACTIVE TRACK (Post-Permission)
+      const track = stream.getVideoTracks()[0];
+      const activeLabel = track.label.toLowerCase();
+      if (BANNED_DRIVERS.some(banned => activeLabel.includes(banned))) {
+          track.stop();
+          alert("SECURITY ALERT: Virtual Driver Blocked.");
+          return false;
+      }
+
       streamRef.current = stream;
       if (videoRef.current) videoRef.current.srcObject = stream;
       return true;
@@ -618,10 +667,11 @@ const PPAHVerification = () => {
                  <h2 className="text-lg font-semibold drop-shadow-md">{roomId || "PPAH Secure"}</h2>
                  {inCall && <div className="bg-blue-600/20 px-2 py-0.5 rounded text-[10px] text-blue-400 font-bold border border-blue-500/30">ENCRYPTED</div>}
               </div>
+              {/* TIMER ONLY SHOWS IF REMOTE IS CONNECTED */}
               {isRemoteConnected && <span className="text-sm font-medium opacity-80">{formatTime(callDuration)}</span>}
             </div>
 
-            {/* Right: Security Badges */}
+            {/* Right: Security Badges (SUBTLE) */}
             {inCall && (
                 <div className="flex flex-col items-end gap-1">
                    {remoteTrustScore !== null && (
