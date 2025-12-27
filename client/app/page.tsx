@@ -79,8 +79,9 @@ const PPAHVerification = () => {
   const anchorBiometricRef = useRef<any | null>(null);
   const workerRef = useRef<Worker | null>(null);
   
-  // CHANGED: monitoringRef is now for setTimeout, not setInterval
+  // Loop Control Refs
   const monitoringRef = useRef<NodeJS.Timeout | null>(null);
+  const isMonitoringActive = useRef(false); // Prevents Zombie Loops
   
   const trustScoreRef = useRef(trustScore); 
   const landmarkerRef = useRef<FaceLandmarker | null>(null);
@@ -198,10 +199,10 @@ const PPAHVerification = () => {
   };
 
   const cleanup = () => {
+    isMonitoringActive.current = false; // STOP LOOP
     streamRef.current?.getTracks().forEach(t => t.stop());
     if (socketRef.current) socketRef.current.close();
     if (peerConnection.current) peerConnection.current.close();
-    // CHANGED: Use clearTimeout instead of clearInterval
     if (monitoringRef.current) clearTimeout(monitoringRef.current);
   };
 
@@ -377,22 +378,21 @@ const PPAHVerification = () => {
     challengeActiveRef.current = false;
   };
 
-  // --- 7. MONITORING LOOP (ADAPTIVE UPDATE) ---
+  // --- 7. MONITORING LOOP (ADAPTIVE & ROBUST) ---
   const startMonitoring = (activeSid: string) => {
     let seg = 1;
-    let isRunning = true; 
+    isMonitoringActive.current = true; // START FLAG
 
-    // RECURSIVE LOOP FOR ADAPTIVE TIMING
     const loop = async () => {
-        if (!isRunning) return; 
+        if (!isMonitoringActive.current) return; 
 
         const startTime = Date.now();
         const video = videoRef.current;
         const canvas = canvasRef.current;
 
-        // Perform Checks if Video Ready
         if (video && canvas && landmarkerRef.current && video.readyState >= 2) {
             try {
+                // 1. AI Analysis
                 const results = landmarkerRef.current.detectForVideo(video, performance.now());
                 if (results.faceLandmarks.length > 0) {
                     setFaceDetected(true);
@@ -404,36 +404,48 @@ const PPAHVerification = () => {
                 } else {
                     setFaceDetected(false);
                     noFaceCounter.current += 1;
-                    if (noFaceCounter.current > 3 && !challengeActiveRef.current) {
-                        handleSecurityEvent("No Face", 15);
+                    // SLOW DECAY: Wait 10 frames, then drop 2 points
+                    if (noFaceCounter.current > 10 && !challengeActiveRef.current) {
+                        handleSecurityEvent("No Face", 2);
                     }
                 }
-            } catch (e) {}
 
-            const ctx = canvas.getContext('2d', { willReadFrequently: true });
-            if (ctx) {
-                ctx.drawImage(video, 0, 0);
-                const imgData = ctx.getImageData(0,0,640,480);
-                if (seg === 1) workerRef.current?.postMessage({ type: 'GENERATE_ANCHOR', imageData: imgData });
-                else if (!challengeActiveRef.current) {
-                    workerRef.current?.postMessage({ type: 'ANALYZE_FRAME', imageData: imgData, anchorBiometric: anchorBiometricRef.current });
+                // 2. Cryptographic Hashing (Wrapped in Try/Catch to prevent crash)
+                const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                if (ctx) {
+                    ctx.drawImage(video, 0, 0);
+                    const imgData = ctx.getImageData(0,0,640,480);
+                    
+                    if (seg === 1) workerRef.current?.postMessage({ type: 'GENERATE_ANCHOR', imageData: imgData });
+                    else if (!challengeActiveRef.current) {
+                        workerRef.current?.postMessage({ type: 'ANALYZE_FRAME', imageData: imgData, anchorBiometric: anchorBiometricRef.current });
+                    }
+
+                    const hashBuf = await crypto.subtle.digest('SHA-256', imgData.data);
+                    const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
+                    
+                    // NETWORK CALL - FAIL SAFE
+                    try {
+                        await fetch(`${getBackendUrl()}/api/verify-hash`, {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ session_id: activeSid, segment_id: seg, hash: hashHex, trust_score: trustScoreRef.current, signature: sig })
+                        });
+                        seg++;
+                    } catch (netErr) {
+                        console.warn("Heartbeat skipped (Network Error)", netErr);
+                    }
                 }
-                const hashBuf = await crypto.subtle.digest('SHA-256', imgData.data);
-                const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
-                const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
-                await fetch(`${getBackendUrl()}/api/verify-hash`, {
-                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ session_id: activeSid, segment_id: seg, hash: hashHex, trust_score: trustScoreRef.current, signature: sig })
-                });
-                seg++;
+            } catch (loopErr) {
+                console.error("Monitoring Loop Error", loopErr);
             }
         }
 
         // --- ADAPTIVE LOGIC ---
-        // If Trust is low OR Network is unstable -> Speed up to 200ms
+        // High Risk (Low Score OR Bad Connection) -> Fast (200ms)
         let nextDelay = 1000;
         if (trustScoreRef.current < 80 || iceStatus !== 'Connected') {
-            nextDelay = 200; // FAST MODE
+            nextDelay = 200; 
         }
 
         const processingTime = Date.now() - startTime;
@@ -442,10 +454,10 @@ const PPAHVerification = () => {
         monitoringRef.current = setTimeout(loop, actualDelay);
     };
 
-    loop(); // Start the loop
+    loop(); 
   };
 
-  // --- AUTH & INIT (UPDATED WITH BLOCKER) ---
+  // --- AUTH & INIT (WITH BLOCKER) ---
   const initializeCamera = async () => {
     setStatusMessage('Init Camera...');
     try {
@@ -455,7 +467,6 @@ const PPAHVerification = () => {
       
       for (const device of videoInputs) {
           const label = device.label.toLowerCase();
-          // Check for banned keywords in available devices
           if (BANNED_DRIVERS.some(banned => label.includes(banned))) {
               alert(`SECURITY ALERT: Virtual Camera Detected (${device.label}). Access Denied.`);
               return false;
@@ -468,7 +479,7 @@ const PPAHVerification = () => {
           audio: true 
       });
 
-      // 3. DOUBLE CHECK ACTIVE TRACK (Post-Permission)
+      // 3. DOUBLE CHECK TRACK
       const track = stream.getVideoTracks()[0];
       const activeLabel = track.label.toLowerCase();
       if (BANNED_DRIVERS.some(banned => activeLabel.includes(banned))) {
@@ -629,7 +640,6 @@ const PPAHVerification = () => {
     if (remoteSessionId) {
       const interval = setInterval(async () => {
           try {
-              // Add timestamp to bust cache
               const res = await fetch(`${getBackendUrl()}/api/session/${remoteSessionId}/security-report?t=${Date.now()}`);
               if (res.ok) {
                   const data = await res.json();
@@ -674,10 +684,10 @@ const PPAHVerification = () => {
             {/* Right: Security Badges (SUBTLE) */}
             {inCall && (
                 <div className="flex flex-col items-end gap-1">
-                   {remoteTrustScore !== null && (
-                     <div className={`flex items-center gap-1.5 px-2 py-1 rounded-full backdrop-blur-md border ${remoteTrustScore > 80 ? 'bg-green-900/40 border-green-500/30 text-green-400' : 'bg-red-900/40 border-red-500/30 text-red-400'}`}>
+                   {(remoteTrustScore !== null || isRemoteConnected) && (
+                     <div className={`flex items-center gap-1.5 px-2 py-1 rounded-full backdrop-blur-md border ${(remoteTrustScore || 100) > 80 ? 'bg-green-900/40 border-green-500/30 text-green-400' : 'bg-red-900/40 border-red-500/30 text-red-400'}`}>
                         <Shield size={12} fill="currentColor" />
-                        <span className="text-xs font-bold">{remoteTrustScore}%</span>
+                        <span className="text-xs font-bold">{remoteTrustScore !== null ? remoteTrustScore : 'Syncing...'}%</span>
                      </div>
                    )}
                    <div className="flex items-center gap-1 opacity-60">
