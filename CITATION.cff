@@ -3,6 +3,10 @@ message: "If you use this software in your research, please cite it as below."
 authors:
   - family-names: "Dighomanor"
     given-names: "Jeremiah"
+  - family-names: "Ogar"
+    given-names: "David"
+  - family-names: "Omosigho"
+    given-names: "Alex"
     affiliation: "Wale Lab Fellow"
 title: "PPAH 3.0: Privacy-Preserving Adaptive Hashing Verification System"
 version: 3.0.0
