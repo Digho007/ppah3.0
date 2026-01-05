@@ -140,7 +140,9 @@ ngrok http 3000
 * Check the server logs. If the server considers the session "Frozen" (Score < 40%), it will enforce the blur. Perform the liveness challenge (Head Yaw) to unfreeze.
 
 
+
 **Works strictly on Google Chrome because it supports WebAuthn**
+
 
 ---
 
