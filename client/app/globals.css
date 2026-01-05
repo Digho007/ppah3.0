@@ -1,1 +1,25 @@
 @import "tailwindcss";
+
+/* --- HIDE THE "N" ICON (Nuclear Option) --- */
+/* This forces the development indicator to be invisible */
+
+/* Hides the wrapper and the icon itself */
+[data-nextjs-toast],
+[data-nextjs-toast-wrapper],
+div[class*="nextjs-toast"], 
+div[class*="nextjs-static-indicator"],
+div[class*="dev-indicator"],
+nextjs-portal {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+/* Hides the shadow DOM host if possible */
+body > div[id^="__next-build-watcher"],
+body > div[id^="next-route-announcer"] + div {
+   display: none !important;
+}
