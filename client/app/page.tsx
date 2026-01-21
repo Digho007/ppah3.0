@@ -7,18 +7,29 @@ import {
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
 
-// --- 1. ERROR SUPPRESSION ---
+// --- 1. ERROR FILTERING (Updated for Better Debugging) ---
 if (typeof window !== 'undefined') {
   const originalError = console.error;
   const originalInfo = console.info;
+  const originalWarn = console.warn;
+  
   console.error = (...args) => {
+    // Filter known harmless errors
     if (/NotAllowedError/.test(args[0]?.toString())) return;
     if (/Created TensorFlow Lite XNNPACK/.test(args[0]?.toString())) return;
-    originalError.call(console, ...args);
+    // Log all other errors with context
+    originalError.call(console, '[PPAH Error]', ...args);
   };
+  
   console.info = (...args) => {
+    // Filter TensorFlow noise
     if (/Created TensorFlow Lite XNNPACK/.test(args[0]?.toString())) return;
     originalInfo.call(console, ...args);
+  };
+  
+  console.warn = (...args) => {
+    // Always log warnings with PPAH tag for easier filtering
+    originalWarn.call(console, '[PPAH Warning]', ...args);
   };
 }
 
@@ -86,6 +97,17 @@ const PPAHVerification = () => {
   const previousBrightnessRef = useRef<number | null>(null);
   const brightnessVolatilityRef = useRef<number>(0);
   const baselineBrightnessRef = useRef<number>(0);
+  const brightnessHistoryRef = useRef<number[]>([]);
+  const colorEntropyRef = useRef<number>(0);
+  const previousColorEntropyRef = useRef<number | null>(null);
+  
+  // EMA for trust score (Exponential Moving Average)
+  const trustScoreEMA = useRef<number>(100);
+  const EMA_ALPHA = 0.3; // Smoothing factor (0-1, lower = more smoothing)
+  
+  // Environmental stability tracking
+  const environmentStableCountRef = useRef<number>(0);
+  const lastBrightnessChangeRef = useRef<number>(Date.now());
   
   // Loop Control Refs
   const monitoringRef = useRef<NodeJS.Timeout | null>(null);
@@ -195,13 +217,30 @@ const PPAHVerification = () => {
 
   const handleSecurityEvent = (reason: string, penalty: number) => {
       if (challengeActiveRef.current) return;
+      
+      console.log(`[PPAH Security] Event: ${reason}, Penalty: ${penalty}, Current Score: ${trustScoreRef.current}`);
+      
       if (Date.now() - lastSuccessTimeRef.current < 5000) { 
           setTrustScore(prev => Math.min(100, prev + 1)); 
           return;
       }
+      
       setTrustScore(prev => {
-          const newScore = Math.max(0, prev - penalty);
-          if (newScore < 40 && !challengeActiveRef.current) triggerLivenessChallenge();
+          const targetScore = Math.max(0, prev - penalty);
+          
+          // Apply EMA smoothing to avoid abrupt changes
+          const smoothedScore = Math.round(
+            trustScoreEMA.current * (1 - EMA_ALPHA) + targetScore * EMA_ALPHA
+          );
+          trustScoreEMA.current = smoothedScore;
+          
+          const newScore = Math.max(0, Math.min(100, smoothedScore));
+          
+          if (newScore < 40 && !challengeActiveRef.current) {
+            console.warn(`[PPAH Security] Trust score critically low (${newScore}%), triggering liveness challenge`);
+            triggerLivenessChallenge();
+          }
+          
           return newScore;
       });
   };
@@ -453,22 +492,68 @@ const PPAHVerification = () => {
                     ctx.drawImage(video, 0, 0);
                     const imgData = ctx.getImageData(0,0,640,480);
                     
-                    // A. Calculate Brightness
+                    // A. Calculate Brightness & Color Entropy
                     const currentBrightness = calculateBrightness(imgData.data);
+                    const currentColorEntropy = calculateColorEntropy(imgData.data);
                     
-                    // B. Check for "Impossible" Shifts (Video Swap Signature)
-                    if (previousBrightnessRef.current !== null) {
-                        const delta = Math.abs(currentBrightness - previousBrightnessRef.current);
+                    // Update brightness history for environmental stability tracking
+                    brightnessHistoryRef.current.push(currentBrightness);
+                    if (brightnessHistoryRef.current.length > 10) {
+                      brightnessHistoryRef.current.shift();
+                    }
+                    
+                    // B. Combined Heuristics for Scene Shift Detection
+                    if (previousBrightnessRef.current !== null && previousColorEntropyRef.current !== null) {
+                        const brightnessDelta = Math.abs(currentBrightness - previousBrightnessRef.current);
+                        const entropyDelta = Math.abs(currentColorEntropy - previousColorEntropyRef.current);
                         
-                        // THRESHOLD: If brightness jumps >15 (approx 6%) instantly, it's a swap
-                        if (delta > 15 && !challengeActiveRef.current && !isFlashActive) {
-                            console.warn(`[PPAH] Scene Shift Detected: Delta ${delta.toFixed(1)}`);
-                            aggressiveMode = true; // Trigger fast hashing
-                            // Penalize score for the suspicious jump
-                            handleSecurityEvent("Scene Shift", 10); 
+                        // Calculate environmental stability (variance over last 10 samples)
+                        let brightnessVariance = 0;
+                        if (brightnessHistoryRef.current.length >= 5) {
+                          const mean = brightnessHistoryRef.current.reduce((a, b) => a + b, 0) / brightnessHistoryRef.current.length;
+                          brightnessVariance = brightnessHistoryRef.current.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / brightnessHistoryRef.current.length;
+                        }
+                        
+                        // Dynamic threshold based on environmental stability
+                        // More stable environment = stricter threshold
+                        const isEnvironmentStable = brightnessVariance < 50;
+                        const brightnessThreshold = isEnvironmentStable ? 20 : 30; // Increased from fixed 15
+                        const entropyThreshold = isEnvironmentStable ? 0.8 : 1.2;
+                        
+                        // Track environmental stability
+                        if (brightnessDelta < 5) {
+                          environmentStableCountRef.current++;
+                        } else {
+                          environmentStableCountRef.current = 0;
+                        }
+                        
+                        // Scene shift detection with combined heuristics
+                        // Requires BOTH brightness AND entropy changes to reduce false positives
+                        const timeSinceLastChange = Date.now() - lastBrightnessChangeRef.current;
+                        const isLikelyNaturalChange = timeSinceLastChange > 10000 && environmentStableCountRef.current > 5;
+                        
+                        if (brightnessDelta > brightnessThreshold && 
+                            entropyDelta > entropyThreshold && 
+                            !challengeActiveRef.current && 
+                            !isFlashActive &&
+                            !isLikelyNaturalChange) {
+                            
+                            console.warn(`[PPAH] Scene Shift Detected - Brightness: ${brightnessDelta.toFixed(1)}, Entropy: ${entropyDelta.toFixed(2)}, Variance: ${brightnessVariance.toFixed(1)}`);
+                            aggressiveMode = true;
+                            lastBrightnessChangeRef.current = Date.now();
+                            environmentStableCountRef.current = 0;
+                            
+                            // Reduced penalty with EMA smoothing
+                            handleSecurityEvent("Scene Shift", 8); 
+                        } else if (brightnessDelta > brightnessThreshold && isLikelyNaturalChange) {
+                            // Log natural environmental change without penalty
+                            console.log(`[PPAH] Natural brightness change detected (gradual): ${brightnessDelta.toFixed(1)}`);
                         }
                     }
+                    
                     previousBrightnessRef.current = currentBrightness;
+                    previousColorEntropyRef.current = currentColorEntropy;
+                    colorEntropyRef.current = currentColorEntropy;
 
                     // 2. Worker Logic (Updated for Dynamic Calibration)
                     if (seg === 1) workerRef.current?.postMessage({ type: 'CALIBRATE', imageData: imgData }); 
@@ -480,26 +565,34 @@ const PPAHVerification = () => {
                         });
                     }
 
-                    // 3. Cryptographic Hashing
-                    const hashBuf = await crypto.subtle.digest('SHA-256', imgData.data);
-                    const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
-                    
-                    // If Aggressive Mode, we tag the signature
-                    const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
-                    
+                    // 3. Cryptographic Hashing with improved error handling
                     try {
-                         await fetch(`${getBackendUrl()}/api/verify-hash`, {
-                            method: 'POST', headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ 
-                                session_id: activeSid, 
-                                segment_id: seg, 
-                                hash: hashHex, 
-                                trust_score: trustScoreRef.current, 
-                                signature: sig 
-                            })
-                        });
-                        seg++;
-                    } catch (netErr) { }
+                        const hashBuf = await crypto.subtle.digest('SHA-256', imgData.data);
+                        const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+                        
+                        // If Aggressive Mode, we tag the signature
+                        const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
+                        
+                        try {
+                             await fetch(`${getBackendUrl()}/api/verify-hash`, {
+                                method: 'POST', headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({ 
+                                    session_id: activeSid, 
+                                    segment_id: seg, 
+                                    hash: hashHex, 
+                                    trust_score: trustScoreRef.current, 
+                                    signature: sig 
+                                })
+                            });
+                            seg++;
+                        } catch (netErr) { 
+                            console.warn(`[PPAH Network] Hash verification failed for segment ${seg}:`, netErr);
+                            // Fallback: Continue without terminating session for transient network issues
+                        }
+                    } catch (hashErr) {
+                        console.error(`[PPAH Hash Error] Failed to compute hash for segment ${seg}:`, hashErr);
+                        // Fallback: Skip this frame and continue monitoring
+                    }
                 }
 
                 // 4. MediaPipe Face Check (Existing Logic)
@@ -507,9 +600,17 @@ const PPAHVerification = () => {
                 if (results.faceLandmarks.length > 0) {
                     setFaceDetected(true);
                     noFaceCounter.current = 0; 
-                    if (!challengeActiveRef.current && trustScoreRef.current > 0) {
-                         // Recovery is slower if we just saw a scene shift
-                         setTrustScore(prev => Math.min(100, prev + (aggressiveMode ? 1 : 5)));
+                    if (!challengeActiveRef.current && trustScoreRef.current > 0 && trustScoreRef.current < 100) {
+                         // Apply EMA smoothing to trust score recovery
+                         const recoveryAmount = aggressiveMode ? 1 : 3; // Reduced from 1:5 for gradual recovery
+                         setTrustScore(prev => {
+                            const targetScore = Math.min(100, prev + recoveryAmount);
+                            const smoothedScore = Math.round(
+                              trustScoreEMA.current * (1 - EMA_ALPHA) + targetScore * EMA_ALPHA
+                            );
+                            trustScoreEMA.current = smoothedScore;
+                            return Math.min(100, smoothedScore);
+                         });
                     }
                 } else {
                     setFaceDetected(false);
@@ -518,7 +619,14 @@ const PPAHVerification = () => {
                 }
 
             } catch (loopErr) {
-                console.error("Monitoring Loop Error", loopErr);
+                console.error(`[PPAH Monitoring Error] Frame processing failed:`, {
+                    error: loopErr,
+                    segment: seg,
+                    trustScore: trustScoreRef.current,
+                    faceDetected,
+                    timestamp: new Date().toISOString()
+                });
+                // Fallback: Continue monitoring despite error
             }
         }
 
@@ -528,12 +636,40 @@ const PPAHVerification = () => {
             triggerScreenFlashCheck();
         }
 
-        // --- ADAPTIVE TIMING (The "War Room" Logic) ---
-        // Normal: 1000ms
-        // Aggressive (Scene Shift or Low Score): 200ms
+        // --- ADAPTIVE TIMING (Weighted Metrics Logic) ---
+        // Calculate weighted interval based on multiple factors
+        // Base interval: 1000ms
+        // Factors: Trust Score (40%), Network Stability (30%), Scene Stability (30%)
         let nextDelay = 1000;
-        if (aggressiveMode || trustScoreRef.current < 80 || iceStatus !== 'Connected') {
-            nextDelay = 200; 
+        
+        // Trust score factor (40% weight)
+        const trustFactor = trustScoreRef.current / 100;
+        
+        // Network stability factor (30% weight)
+        const networkFactor = iceStatus === 'Connected' ? 1.0 : 0.3;
+        
+        // Environmental stability factor (30% weight)
+        const envStability = environmentStableCountRef.current >= 5 ? 1.0 : 0.5;
+        
+        // Combined weighted score (0-1 range)
+        const combinedScore = (trustFactor * 0.4) + (networkFactor * 0.3) + (envStability * 0.3);
+        
+        // Map combined score to interval range
+        // High score (>0.8): 1000ms (normal)
+        // Medium score (0.5-0.8): 500ms (moderate)
+        // Low score (<0.5): 300ms (aggressive but not extreme)
+        // Scene shift detected: 250ms (most aggressive)
+        if (aggressiveMode) {
+            nextDelay = 250; // Scene shift detected
+            console.log(`[PPAH Adaptive Hash] Aggressive mode active, interval: ${nextDelay}ms`);
+        } else if (combinedScore > 0.8) {
+            nextDelay = 1000; // Normal monitoring
+        } else if (combinedScore > 0.5) {
+            nextDelay = 500; // Moderate monitoring
+            console.log(`[PPAH Adaptive Hash] Moderate monitoring, combined score: ${combinedScore.toFixed(2)}, interval: ${nextDelay}ms`);
+        } else {
+            nextDelay = 300; // Heightened monitoring
+            console.log(`[PPAH Adaptive Hash] Heightened monitoring, combined score: ${combinedScore.toFixed(2)}, interval: ${nextDelay}ms`);
         }
 
         const processingTime = Date.now() - startTime;
@@ -918,6 +1054,33 @@ const calculateBrightness = (data: Uint8ClampedArray) => {
     samples++;
   }
   return sum / samples; // Returns 0-255
+};
+
+// --- HELPER: COLOR ENTROPY CALCULATOR ---
+const calculateColorEntropy = (data: Uint8ClampedArray) => {
+  const histogram = new Array(256).fill(0);
+  let samples = 0;
+  
+  // Build histogram of brightness values
+  for (let i = 0; i < data.length; i += 40) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+    histogram[gray]++;
+    samples++;
+  }
+  
+  // Calculate Shannon entropy
+  let entropy = 0;
+  for (let count of histogram) {
+    if (count > 0) {
+      const p = count / samples;
+      entropy -= p * Math.log2(p);
+    }
+  }
+  
+  return entropy; // Returns 0-8 (bits)
 };
 
 export default PPAHVerification;

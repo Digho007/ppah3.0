@@ -1,12 +1,6 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // --- NEW: Hide the "N" Icon (Dev Indicators) ---
-  devIndicators: {
-    buildActivity: false,
-    appIsrStatus: false,
-  },
-
   async rewrites() {
     return [
       {
