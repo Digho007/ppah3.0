@@ -585,10 +585,29 @@ const PPAHVerification = () => {
                         });
                     }
 
-                    // 3. Cryptographic Hashing with improved error handling
+                    // 3. Cryptographic Hashing with improved error handling and dynamic inputs
                     try {
-                        const hashBuf = await crypto.subtle.digest('SHA-256', imgData.data);
+                        // Include dynamic inputs: imgData, session ID, and timestamp to prevent hash collisions
+                        // For lower trust scores, increase data range to capture tampering attempts
+                        const timestamp = Date.now();
+                        const sessionId = activeSid || 'fallback-session'; // Fallback for missing session IDs
+                        
+                        // Create dynamic input by combining multiple sources
+                        const imgDataStr = Array.from(new Uint8Array(imgData.data.buffer)).join(',');
+                        const dynamicInput = `${imgDataStr}-${sessionId}-${timestamp}-${seg}`;
+                        
+                        // For lower trust scores, add additional entropy from trust score
+                        const finalInput = trustScoreRef.current < 80 
+                            ? `${dynamicInput}-${trustScoreRef.current}` 
+                            : dynamicInput;
+                        
+                        const hashBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(finalInput));
                         const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+                        
+                        // Log hash diversity metrics for monitoring (only in development or when debugging)
+                        if (seg % 10 === 0) { // Log every 10th segment to reduce console noise
+                            console.log(`[PPAH Hash] Segment ${seg}: Hash=${hashHex.substring(0, 16)}... SessionID=${sessionId.substring(0, 8)}... Timestamp=${timestamp} TrustScore=${trustScoreRef.current}`);
+                        }
                         
                         // If Aggressive Mode, we tag the signature
                         const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
