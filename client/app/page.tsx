@@ -59,6 +59,9 @@ const PPAHVerification = () => {
   const [challengeActive, setChallengeActive] = useState(false);
   const [currentChallenge, setCurrentChallenge] = useState<string | null>(null);
   
+  // NEW STATE: PASSIVE LIVENESS (FLASH)
+  const [isFlashActive, setIsFlashActive] = useState(false);
+  
   // PIP STATE
   const [pipPosition, setPipPosition] = useState({ x: 0, y: 0 }); 
   const [isDragging, setIsDragging] = useState(false);
@@ -78,6 +81,11 @@ const PPAHVerification = () => {
   const webAuthnCredRef = useRef<string | null>(null);
   const anchorBiometricRef = useRef<any | null>(null);
   const workerRef = useRef<Worker | null>(null);
+  
+  // NEW REFS: BRIGHTNESS HEURISTIC
+  const previousBrightnessRef = useRef<number | null>(null);
+  const brightnessVolatilityRef = useRef<number>(0);
+  const baselineBrightnessRef = useRef<number>(0);
   
   // Loop Control Refs
   const monitoringRef = useRef<NodeJS.Timeout | null>(null);
@@ -329,7 +337,51 @@ const PPAHVerification = () => {
     return () => clearInterval(timer);
   }, [isRemoteConnected]);
 
-  // --- 6. CHALLENGE LOGIC ---
+  // --- 6. CHALLENGE LOGIC & SCREEN FLASH ---
+  
+  const triggerScreenFlashCheck = async () => {
+    if (!videoRef.current || !canvasRef.current) return;
+    
+    // 1. Measure Baseline Brightness (Before Flash)
+    const ctx = canvasRef.current.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(videoRef.current, 0, 0);
+    const preData = ctx.getImageData(0, 0, 640, 480).data;
+    const preBrightness = calculateBrightness(preData);
+    
+    console.log(`[PPAH] Pre-Flash Brightness: ${preBrightness.toFixed(2)}`);
+
+    // 2. TRIGGER THE FLASH (Visual)
+    setIsFlashActive(true); 
+
+    // 3. Wait 150ms (Allow light to travel and camera to capture)
+    await new Promise(r => setTimeout(r, 150));
+
+    // 4. Measure "During Flash" Brightness
+    ctx.drawImage(videoRef.current, 0, 0);
+    const postData = ctx.getImageData(0, 0, 640, 480).data;
+    const postBrightness = calculateBrightness(postData);
+
+    // 5. REMOVE FLASH
+    setIsFlashActive(false);
+
+    console.log(`[PPAH] Post-Flash Brightness: ${postBrightness.toFixed(2)}`);
+
+    // 6. PHYSICS CHECK
+    // A real face close to a screen MUST get brighter
+    // A Virtual Camera will have 0.0 change.
+    const delta = postBrightness - preBrightness;
+    
+    if (delta < 2.0) {
+        console.warn(`[PPAH] PHYSICS FAIL: Face did not reflect screen light. Delta: ${delta}`);
+        handleSecurityEvent("Liveness Fail (Physics)", 20); // Big penalty
+    } else {
+        console.log("[PPAH] Physics Pass: Light reflection detected.");
+        // Reward the user
+        setTrustScore(prev => Math.min(100, prev + 5));
+    }
+  };
+
   const triggerLivenessChallenge = async () => {
     if (challengeActiveRef.current || !landmarkerRef.current) return;
     challengeActiveRef.current = true;
@@ -378,10 +430,10 @@ const PPAHVerification = () => {
     challengeActiveRef.current = false;
   };
 
-  // --- 7. MONITORING LOOP (ADAPTIVE & ROBUST) ---
+  // --- 7. MONITORING LOOP (HARDENED) ---
   const startMonitoring = (activeSid: string) => {
     let seg = 1;
-    isMonitoringActive.current = true; // START FLAG
+    isMonitoringActive.current = true;
 
     const loop = async () => {
         if (!isMonitoringActive.current) return; 
@@ -390,61 +442,97 @@ const PPAHVerification = () => {
         const video = videoRef.current;
         const canvas = canvasRef.current;
 
+        // --- HEURISTIC VARIABLES ---
+        let aggressiveMode = false;
+
         if (video && canvas && landmarkerRef.current && video.readyState >= 2) {
             try {
-                // 1. AI Analysis
-                const results = landmarkerRef.current.detectForVideo(video, performance.now());
-                if (results.faceLandmarks.length > 0) {
-                    setFaceDetected(true);
-                    noFaceCounter.current = 0; 
-                    if (!challengeActiveRef.current && trustScoreRef.current > 0) {
-                         setTrustScore(prev => Math.min(100, prev + 5));
-                         if (trustScoreRef.current > 90) setStatusMessage("Secured");
-                    }
-                } else {
-                    setFaceDetected(false);
-                    noFaceCounter.current += 1;
-                    // SLOW DECAY: Wait 10 frames, then drop 2 points
-                    if (noFaceCounter.current > 10 && !challengeActiveRef.current) {
-                        handleSecurityEvent("No Face", 2);
-                    }
-                }
-
-                // 2. Cryptographic Hashing (Wrapped in Try/Catch to prevent crash)
+                // 1. Scene & Brightness Analysis (The Swap Detector)
                 const ctx = canvas.getContext('2d', { willReadFrequently: true });
                 if (ctx) {
                     ctx.drawImage(video, 0, 0);
                     const imgData = ctx.getImageData(0,0,640,480);
                     
-                    if (seg === 1) workerRef.current?.postMessage({ type: 'GENERATE_ANCHOR', imageData: imgData });
+                    // A. Calculate Brightness
+                    const currentBrightness = calculateBrightness(imgData.data);
+                    
+                    // B. Check for "Impossible" Shifts (Video Swap Signature)
+                    if (previousBrightnessRef.current !== null) {
+                        const delta = Math.abs(currentBrightness - previousBrightnessRef.current);
+                        
+                        // THRESHOLD: If brightness jumps >15 (approx 6%) instantly, it's a swap
+                        if (delta > 15 && !challengeActiveRef.current && !isFlashActive) {
+                            console.warn(`[PPAH] Scene Shift Detected: Delta ${delta.toFixed(1)}`);
+                            aggressiveMode = true; // Trigger fast hashing
+                            // Penalize score for the suspicious jump
+                            handleSecurityEvent("Scene Shift", 10); 
+                        }
+                    }
+                    previousBrightnessRef.current = currentBrightness;
+
+                    // 2. Worker Logic (Updated for Dynamic Calibration)
+                    if (seg === 1) workerRef.current?.postMessage({ type: 'CALIBRATE', imageData: imgData }); 
                     else if (!challengeActiveRef.current) {
-                        workerRef.current?.postMessage({ type: 'ANALYZE_FRAME', imageData: imgData, anchorBiometric: anchorBiometricRef.current });
+                        workerRef.current?.postMessage({ 
+                            type: 'ANALYZE_FRAME', 
+                            imageData: imgData, 
+                            anchorBiometric: anchorBiometricRef.current 
+                        });
                     }
 
+                    // 3. Cryptographic Hashing
                     const hashBuf = await crypto.subtle.digest('SHA-256', imgData.data);
                     const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    
+                    // If Aggressive Mode, we tag the signature
                     const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
                     
-                    // NETWORK CALL - FAIL SAFE
                     try {
-                        await fetch(`${getBackendUrl()}/api/verify-hash`, {
+                         await fetch(`${getBackendUrl()}/api/verify-hash`, {
                             method: 'POST', headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ session_id: activeSid, segment_id: seg, hash: hashHex, trust_score: trustScoreRef.current, signature: sig })
+                            body: JSON.stringify({ 
+                                session_id: activeSid, 
+                                segment_id: seg, 
+                                hash: hashHex, 
+                                trust_score: trustScoreRef.current, 
+                                signature: sig 
+                            })
                         });
                         seg++;
-                    } catch (netErr) {
-                        console.warn("Heartbeat skipped (Network Error)", netErr);
-                    }
+                    } catch (netErr) { }
                 }
+
+                // 4. MediaPipe Face Check (Existing Logic)
+                const results = landmarkerRef.current.detectForVideo(video, performance.now());
+                if (results.faceLandmarks.length > 0) {
+                    setFaceDetected(true);
+                    noFaceCounter.current = 0; 
+                    if (!challengeActiveRef.current && trustScoreRef.current > 0) {
+                         // Recovery is slower if we just saw a scene shift
+                         setTrustScore(prev => Math.min(100, prev + (aggressiveMode ? 1 : 5)));
+                    }
+                } else {
+                    setFaceDetected(false);
+                    noFaceCounter.current += 1;
+                    if (noFaceCounter.current > 10) handleSecurityEvent("No Face", 2);
+                }
+
             } catch (loopErr) {
                 console.error("Monitoring Loop Error", loopErr);
             }
         }
 
-        // --- ADAPTIVE LOGIC ---
-        // High Risk (Low Score OR Bad Connection) -> Fast (200ms)
+        // --- RANDOM PHYSICS CHECK (Step 3: Screen Flash) ---
+        // approx every 300 cycles (~30s), if face is present and no challenge active
+        if (Math.random() < 0.003 && faceDetected && !challengeActiveRef.current && !isFlashActive) {
+            triggerScreenFlashCheck();
+        }
+
+        // --- ADAPTIVE TIMING (The "War Room" Logic) ---
+        // Normal: 1000ms
+        // Aggressive (Scene Shift or Low Score): 200ms
         let nextDelay = 1000;
-        if (trustScoreRef.current < 80 || iceStatus !== 'Connected') {
+        if (aggressiveMode || trustScoreRef.current < 80 || iceStatus !== 'Connected') {
             nextDelay = 200; 
         }
 
@@ -804,10 +892,32 @@ const PPAHVerification = () => {
         </div>
       )}
 
+      {/* SCREEN FLASH OVERLAY (For Passive Liveness) */}
+      <div 
+        className={`fixed inset-0 bg-white z-[100] pointer-events-none transition-opacity duration-75 ${
+          isFlashActive ? 'opacity-90' : 'opacity-0'
+        }`}
+      />
+
       {/* Hidden Analysis Canvas */}
       <canvas ref={canvasRef} width={640} height={480} className="hidden" />
     </div>
   );
+};
+
+// --- HELPER: BRIGHTNESS CALCULATOR (Updated for Performance) ---
+const calculateBrightness = (data: Uint8ClampedArray) => {
+  let sum = 0;
+  let samples = 0;
+  for (let i = 0; i < data.length; i += 40) { // stride of 40 (10 pixels) for performance
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    // Perceived brightness formula
+    sum += 0.299 * r + 0.587 * g + 0.114 * b;
+    samples++;
+  }
+  return sum / samples; // Returns 0-255
 };
 
 export default PPAHVerification;

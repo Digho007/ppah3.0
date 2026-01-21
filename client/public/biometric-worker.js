@@ -1,20 +1,55 @@
 // client/public/biometric-worker.js
 
+// --- STATE FOR DYNAMIC CALIBRATION ---
+let calibrationFrames = [];
+let personalThreshold = 0.45; // Start with default, but we will refine it
+let isCalibrated = false;
+
 self.onmessage = async (e) => {
   const { type, imageData, previousFrames, anchorBiometric, goldenAnchor } = e.data;
 
-  if (type === 'ANALYZE_FRAME') {
-    // 1. Normalize
+  // --- PHASE 1: CALIBRATION (Startup) ---
+  if (type === 'CALIBRATE') {
     const normalizedData = applyLightingNormalization(imageData);
     const fingerprint = createBiometricFingerprint(normalizedData);
     
-    // 2. Liveness (Motion)
+    calibrationFrames.push(fingerprint);
+
+    // Collect 5 frames to determine baseline camera noise
+    if (calibrationFrames.length >= 5 && !isCalibrated) {
+        // Calculate average similarity between these 5 identical frames
+        let totalSim = 0;
+        let checks = 0;
+        for (let i = 0; i < calibrationFrames.length - 1; i++) {
+            totalSim += compareBiometrics(calibrationFrames[i], calibrationFrames[i+1]);
+            checks++;
+        }
+        const avgStability = totalSim / checks;
+        
+        // If camera is noisy (0.8 stability), set threshold lower (0.35)
+        // If camera is crisp (0.99 stability), set threshold higher (0.55)
+        personalThreshold = Math.max(0.35, (avgStability * 0.5)); 
+        
+        console.log(`[PPAH] Calibrated Personal Threshold: ${personalThreshold.toFixed(2)}`);
+        
+        // Set the last frame as the Anchor
+        self.postMessage({ type: 'ANCHOR_GENERATED', fingerprint });
+        isCalibrated = true;
+    }
+  } 
+  
+  // --- PHASE 2: ACTIVE ANALYSIS ---
+  else if (type === 'ANALYZE_FRAME') {
+    const normalizedData = applyLightingNormalization(imageData);
+    const fingerprint = createBiometricFingerprint(normalizedData);
+    
+    // 1. Liveness (Motion)
     let liveness = 0;
     if (previousFrames && previousFrames.length >= 2) {
       liveness = computeLivenessScore(imageData, previousFrames);
     }
 
-    // 3. Compare with Anchors (Dual Check)
+    // 2. Compare with Anchors (Dual Check)
     let similarity = 0;
     
     if (anchorBiometric && goldenAnchor) {
@@ -27,8 +62,8 @@ self.onmessage = async (e) => {
         // C. Weighted Score (Favor Golden Anchor to prevent drift)
         similarity = (rollingScore * 0.4) + (goldenScore * 0.6);
         
-        // Update Rolling Anchor ONLY if match is very high
-        if (similarity > 0.90) {
+        // Update Rolling Anchor ONLY if match is very high (Strict Update based on Dynamic Threshold)
+        if (similarity > (personalThreshold * 2)) { 
             const newRolling = blendBiometrics(anchorBiometric, fingerprint, 0.05);
             self.postMessage({
                 type: 'ANCHOR_UPDATED',
@@ -37,7 +72,7 @@ self.onmessage = async (e) => {
         }
     } 
     else if (anchorBiometric) {
-        // Fallback (Initialization phase)
+        // Fallback (Initialization phase) - Use DYNAMIC Threshold
         similarity = compareBiometrics(fingerprint, anchorBiometric);
     }
 
@@ -45,18 +80,19 @@ self.onmessage = async (e) => {
       type: 'ANALYSIS_RESULT',
       fingerprint,
       liveness,
-      similarity
+      similarity,
+      thresholdUsed: personalThreshold // Send back for debugging
     });
   } 
+  // Keep GENERATE_ANCHOR for manual resets if needed
   else if (type === 'GENERATE_ANCHOR') {
     const normalizedData = applyLightingNormalization(imageData);
     const fingerprint = createBiometricFingerprint(normalizedData);
-    // Return this as BOTH the initial rolling anchor AND the golden anchor
     self.postMessage({ type: 'ANCHOR_GENERATED', fingerprint });
   }
 };
 
-// --- HELPERS (Unchanged from original logic, just condensed for copy-paste) ---
+// --- HELPERS (Unchanged) ---
 
 function blendBiometrics(oldBio, newBio, rate) {
     const newHist = oldBio.histogram.map((val, i) => (val * (1 - rate)) + (newBio.histogram[i] * rate));
