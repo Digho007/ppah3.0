@@ -113,6 +113,7 @@ const PPAHVerification = () => {
   // Environmental stability tracking
   const environmentStableCountRef = useRef<number>(0);
   const lastBrightnessChangeRef = useRef<number>(Date.now());
+  const lastLoggedIntervalRef = useRef<number>(1000); // Track last logged interval to reduce noise
   
   // Loop Control Refs
   const monitoringRef = useRef<NodeJS.Timeout | null>(null);
@@ -238,9 +239,9 @@ const PPAHVerification = () => {
           
           // Apply EMA smoothing to avoid abrupt changes
           // EMA formula: newEMA = alpha * newValue + (1 - alpha) * previousEMA
-          const smoothedScore = Math.round(
-            EMA_ALPHA * targetScore + (1 - EMA_ALPHA) * prev
-          );
+          const newEMA = EMA_ALPHA * targetScore + (1 - EMA_ALPHA) * trustScoreEMA.current;
+          const smoothedScore = Math.round(newEMA);
+          trustScoreEMA.current = newEMA; // Update EMA state
           
           const newScore = Math.max(0, Math.min(100, smoothedScore));
           
@@ -516,10 +517,19 @@ const PPAHVerification = () => {
                         const entropyDelta = Math.abs(currentColorEntropy - previousColorEntropyRef.current);
                         
                         // Calculate environmental stability (variance over last 10 samples)
+                        // Optimized: calculate mean and variance in single pass
                         let brightnessVariance = 0;
                         if (brightnessHistoryRef.current.length >= 5) {
-                          const mean = brightnessHistoryRef.current.reduce((a, b) => a + b, 0) / brightnessHistoryRef.current.length;
-                          brightnessVariance = brightnessHistoryRef.current.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / brightnessHistoryRef.current.length;
+                          let sum = 0;
+                          let sumSq = 0;
+                          const len = brightnessHistoryRef.current.length;
+                          for (let i = 0; i < len; i++) {
+                            const val = brightnessHistoryRef.current[i];
+                            sum += val;
+                            sumSq += val * val;
+                          }
+                          const mean = sum / len;
+                          brightnessVariance = (sumSq / len) - (mean * mean);
                         }
                         
                         // Dynamic threshold based on environmental stability
@@ -554,8 +564,10 @@ const PPAHVerification = () => {
                             // Reduced penalty with EMA smoothing
                             handleSecurityEvent("Scene Shift", 8); 
                         } else if (brightnessDelta > brightnessThreshold && isLikelyNaturalChange) {
-                            // Log natural environmental change without penalty
-                            console.log(`[PPAH] Natural brightness change detected (gradual): ${brightnessDelta.toFixed(1)}`);
+                            // Only log significant natural changes to reduce noise
+                            if (brightnessDelta > brightnessThreshold * 1.5) {
+                              console.log(`[PPAH] Natural brightness change detected (gradual): ${brightnessDelta.toFixed(1)}`);
+                            }
                         }
                     }
                     
@@ -614,9 +626,9 @@ const PPAHVerification = () => {
                          setTrustScore(prev => {
                             const targetScore = Math.min(100, prev + recoveryAmount);
                             // EMA formula: newEMA = alpha * newValue + (1 - alpha) * previousEMA
-                            const smoothedScore = Math.round(
-                              EMA_ALPHA * targetScore + (1 - EMA_ALPHA) * prev
-                            );
+                            const newEMA = EMA_ALPHA * targetScore + (1 - EMA_ALPHA) * trustScoreEMA.current;
+                            const smoothedScore = Math.round(newEMA);
+                            trustScoreEMA.current = newEMA; // Update EMA state
                             return Math.min(100, smoothedScore);
                          });
                     }
@@ -669,15 +681,27 @@ const PPAHVerification = () => {
         // Scene shift detected: 250ms (most aggressive)
         if (aggressiveMode) {
             nextDelay = 250; // Scene shift detected
-            console.log(`[PPAH Adaptive Hash] Aggressive mode active, interval: ${nextDelay}ms`);
+            if (lastLoggedIntervalRef.current !== nextDelay) {
+              console.log(`[PPAH Adaptive Hash] Aggressive mode active, interval: ${nextDelay}ms`);
+              lastLoggedIntervalRef.current = nextDelay;
+            }
         } else if (combinedScore > 0.8) {
             nextDelay = 1000; // Normal monitoring
+            if (lastLoggedIntervalRef.current !== nextDelay) {
+              lastLoggedIntervalRef.current = nextDelay;
+            }
         } else if (combinedScore > 0.5) {
             nextDelay = 500; // Moderate monitoring
-            console.log(`[PPAH Adaptive Hash] Moderate monitoring, combined score: ${combinedScore.toFixed(2)}, interval: ${nextDelay}ms`);
+            if (lastLoggedIntervalRef.current !== nextDelay) {
+              console.log(`[PPAH Adaptive Hash] Moderate monitoring, combined score: ${combinedScore.toFixed(2)}, interval: ${nextDelay}ms`);
+              lastLoggedIntervalRef.current = nextDelay;
+            }
         } else {
             nextDelay = 300; // Heightened monitoring
-            console.log(`[PPAH Adaptive Hash] Heightened monitoring, combined score: ${combinedScore.toFixed(2)}, interval: ${nextDelay}ms`);
+            if (lastLoggedIntervalRef.current !== nextDelay) {
+              console.log(`[PPAH Adaptive Hash] Heightened monitoring, combined score: ${combinedScore.toFixed(2)}, interval: ${nextDelay}ms`);
+              lastLoggedIntervalRef.current = nextDelay;
+            }
         }
 
         const processingTime = Date.now() - startTime;
