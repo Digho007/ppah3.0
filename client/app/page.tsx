@@ -39,6 +39,11 @@ const formatTime = (seconds: number) => {
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 };
 
+// --- SCENE SHIFT DETECTION CONSTANTS ---
+const NATURAL_CHANGE_TIMEOUT = 10000; // 10 seconds - time threshold for gradual environmental changes
+const STABLE_COUNT_THRESHOLD = 5; // Number of stable readings to consider environment stable
+const BRIGHTNESS_VARIANCE_THRESHOLD = 50; // Variance threshold for environmental stability
+
 // --- SECURITY CONFIGURATION ---
 const BANNED_DRIVERS = ['virtual', 'obs', 'manycam', 'loopback', 'vcam', 'droidcam'];
 
@@ -121,7 +126,10 @@ const PPAHVerification = () => {
   const lowBioCounter = useRef(0);
   const lastSuccessTimeRef = useRef<number>(0);
 
-  useEffect(() => { trustScoreRef.current = trustScore; }, [trustScore]);
+  useEffect(() => { 
+    trustScoreRef.current = trustScore; 
+    trustScoreEMA.current = trustScore; // Keep EMA in sync with trust score
+  }, [trustScore]);
 
   // --- ENFORCEMENT ---
   useEffect(() => {
@@ -229,10 +237,10 @@ const PPAHVerification = () => {
           const targetScore = Math.max(0, prev - penalty);
           
           // Apply EMA smoothing to avoid abrupt changes
+          // EMA formula: newEMA = alpha * newValue + (1 - alpha) * previousEMA
           const smoothedScore = Math.round(
-            trustScoreEMA.current * (1 - EMA_ALPHA) + targetScore * EMA_ALPHA
+            EMA_ALPHA * targetScore + (1 - EMA_ALPHA) * prev
           );
-          trustScoreEMA.current = smoothedScore;
           
           const newScore = Math.max(0, Math.min(100, smoothedScore));
           
@@ -516,7 +524,7 @@ const PPAHVerification = () => {
                         
                         // Dynamic threshold based on environmental stability
                         // More stable environment = stricter threshold
-                        const isEnvironmentStable = brightnessVariance < 50;
+                        const isEnvironmentStable = brightnessVariance < BRIGHTNESS_VARIANCE_THRESHOLD;
                         const brightnessThreshold = isEnvironmentStable ? 20 : 30; // Increased from fixed 15
                         const entropyThreshold = isEnvironmentStable ? 0.8 : 1.2;
                         
@@ -530,7 +538,7 @@ const PPAHVerification = () => {
                         // Scene shift detection with combined heuristics
                         // Requires BOTH brightness AND entropy changes to reduce false positives
                         const timeSinceLastChange = Date.now() - lastBrightnessChangeRef.current;
-                        const isLikelyNaturalChange = timeSinceLastChange > 10000 && environmentStableCountRef.current > 5;
+                        const isLikelyNaturalChange = timeSinceLastChange > NATURAL_CHANGE_TIMEOUT && environmentStableCountRef.current > STABLE_COUNT_THRESHOLD;
                         
                         if (brightnessDelta > brightnessThreshold && 
                             entropyDelta > entropyThreshold && 
@@ -605,10 +613,10 @@ const PPAHVerification = () => {
                          const recoveryAmount = aggressiveMode ? 1 : 3; // Reduced from 1:5 for gradual recovery
                          setTrustScore(prev => {
                             const targetScore = Math.min(100, prev + recoveryAmount);
+                            // EMA formula: newEMA = alpha * newValue + (1 - alpha) * previousEMA
                             const smoothedScore = Math.round(
-                              trustScoreEMA.current * (1 - EMA_ALPHA) + targetScore * EMA_ALPHA
+                              EMA_ALPHA * targetScore + (1 - EMA_ALPHA) * prev
                             );
-                            trustScoreEMA.current = smoothedScore;
                             return Math.min(100, smoothedScore);
                          });
                     }
@@ -1045,7 +1053,9 @@ const PPAHVerification = () => {
 const calculateBrightness = (data: Uint8ClampedArray) => {
   let sum = 0;
   let samples = 0;
-  for (let i = 0; i < data.length; i += 40) { // stride of 40 (10 pixels) for performance
+  // Stride of 40 (10 pixels * 4 bytes) for performance
+  // Check bounds to avoid reading beyond array
+  for (let i = 0; i + 2 < data.length; i += 40) {
     const r = data[i];
     const g = data[i + 1];
     const b = data[i + 2];
@@ -1053,7 +1063,7 @@ const calculateBrightness = (data: Uint8ClampedArray) => {
     sum += 0.299 * r + 0.587 * g + 0.114 * b;
     samples++;
   }
-  return sum / samples; // Returns 0-255
+  return samples > 0 ? sum / samples : 0; // Returns 0-255
 };
 
 // --- HELPER: COLOR ENTROPY CALCULATOR ---
@@ -1062,7 +1072,8 @@ const calculateColorEntropy = (data: Uint8ClampedArray) => {
   let samples = 0;
   
   // Build histogram of brightness values
-  for (let i = 0; i < data.length; i += 40) {
+  // Check bounds to avoid reading beyond array
+  for (let i = 0; i + 2 < data.length; i += 40) {
     const r = data[i];
     const g = data[i + 1];
     const b = data[i + 2];
