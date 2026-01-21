@@ -586,83 +586,80 @@ const PPAHVerification = () => {
                     }
 
                     // 3. Cryptographic Hashing with improved error handling and dynamic inputs
-                    try {
-                        // Include dynamic inputs: imgData, session ID, and timestamp to prevent hash collisions
-                        // For lower trust scores, increase data range to capture tampering attempts
-                        const timestamp = Date.now();
-                        
-                        // Generate unique fallback ID if session ID is missing to prevent collisions
-                        const sessionId = activeSid || `fallback-${crypto.randomUUID()}`;
-                        
-                        // Use binary concatenation for efficiency and security
-                        // Convert timestamp and segment to 8-byte buffers for consistent representation
-                        const timestampBuffer = new ArrayBuffer(8);
-                        const timestampView = new DataView(timestampBuffer);
-                        timestampView.setBigUint64(0, BigInt(timestamp), false);
-                        
-                        const segBuffer = new ArrayBuffer(4);
-                        const segView = new DataView(segBuffer);
-                        segView.setUint32(0, seg, false);
-                        
-                        // Encode session ID and trust score
-                        const sessionIdBuffer = new TextEncoder().encode(sessionId);
-                        const trustScoreBuffer = new TextEncoder().encode(trustScoreRef.current.toString());
-                        
-                        // Calculate total size for combined buffer
-                        const totalSize = imgData.data.length + timestampBuffer.byteLength + 
-                                        segBuffer.byteLength + sessionIdBuffer.length + 
-                                        (trustScoreRef.current < 80 ? trustScoreBuffer.length : 0);
-                        
-                        // Create combined buffer with all inputs
-                        const combinedBuffer = new Uint8Array(totalSize);
-                        let offset = 0;
-                        
-                        // Copy image data
-                        combinedBuffer.set(new Uint8Array(imgData.data.buffer), offset);
-                        offset += imgData.data.length;
-                        
-                        // Copy timestamp
-                        combinedBuffer.set(new Uint8Array(timestampBuffer), offset);
-                        offset += timestampBuffer.byteLength;
-                        
-                        // Copy segment ID
-                        combinedBuffer.set(new Uint8Array(segBuffer), offset);
-                        offset += segBuffer.byteLength;
-                        
-                        // Copy session ID
-                        combinedBuffer.set(sessionIdBuffer, offset);
-                        offset += sessionIdBuffer.length;
-                        
-                        // For lower trust scores, add trust score to hash for increased verification rigor
-                        if (trustScoreRef.current < 80) {
-                            combinedBuffer.set(trustScoreBuffer, offset);
-                        }
-                        
-                        const hashBuf = await crypto.subtle.digest('SHA-256', combinedBuffer);
-                        const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
-                        
-                        // If Aggressive Mode, we tag the signature
-                        const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
-                        
+                    // Only compute hash if we have a valid session ID
+                    if (activeSid) {
                         try {
-                             await fetch(`${getBackendUrl()}/api/verify-hash`, {
-                                method: 'POST', headers: {'Content-Type': 'application/json'},
-                                body: JSON.stringify({ 
-                                    session_id: activeSid, 
-                                    segment_id: seg, 
-                                    hash: hashHex, 
-                                    trust_score: trustScoreRef.current, 
-                                    signature: sig 
-                                })
-                            });
-                            seg++;
-                        } catch (netErr) { 
-                            console.warn(`[PPAH Network] Hash verification failed for segment ${seg}:`, netErr);
-                            // Fallback: Continue without terminating session for transient network issues
+                            // Include dynamic inputs: imgData, session ID, and timestamp to prevent hash collisions
+                            const timestamp = Date.now();
+                            
+                            // Use binary concatenation for efficiency and security
+                            // Convert timestamp and segment to 8-byte buffers for consistent representation
+                            const timestampBuffer = new ArrayBuffer(8);
+                            const timestampView = new DataView(timestampBuffer);
+                            timestampView.setBigUint64(0, BigInt(timestamp), false);
+                            
+                            const segBuffer = new ArrayBuffer(4);
+                            const segView = new DataView(segBuffer);
+                            segView.setUint32(0, seg, false);
+                            
+                            // Encode session ID and trust score (always include trust score for consistency)
+                            const sessionIdBuffer = new TextEncoder().encode(activeSid);
+                            const trustScoreBuffer = new TextEncoder().encode(trustScoreRef.current.toString());
+                            
+                            // Calculate total size for combined buffer (always include all components)
+                            const totalSize = imgData.data.length + timestampBuffer.byteLength + 
+                                            segBuffer.byteLength + sessionIdBuffer.length + 
+                                            trustScoreBuffer.length;
+                            
+                            // Create combined buffer with all inputs
+                            const combinedBuffer = new Uint8Array(totalSize);
+                            let offset = 0;
+                            
+                            // Copy image data (imgData.data is Uint8ClampedArray from canvas)
+                            combinedBuffer.set(imgData.data, offset);
+                            offset += imgData.data.length;
+                            
+                            // Copy timestamp
+                            combinedBuffer.set(new Uint8Array(timestampBuffer), offset);
+                            offset += timestampBuffer.byteLength;
+                            
+                            // Copy segment ID
+                            combinedBuffer.set(new Uint8Array(segBuffer), offset);
+                            offset += segBuffer.byteLength;
+                            
+                            // Copy session ID
+                            combinedBuffer.set(sessionIdBuffer, offset);
+                            offset += sessionIdBuffer.length;
+                            
+                            // Always include trust score for consistent hash behavior
+                            combinedBuffer.set(trustScoreBuffer, offset);
+                            
+                            const hashBuf = await crypto.subtle.digest('SHA-256', combinedBuffer);
+                            const hashHex = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+                            
+                            // If Aggressive Mode, we tag the signature
+                            const sig = await signPacket(activeSid, seg, hashHex, trustScoreRef.current);
+                        
+                            try {
+                                 await fetch(`${getBackendUrl()}/api/verify-hash`, {
+                                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                                    body: JSON.stringify({ 
+                                        session_id: activeSid, 
+                                        segment_id: seg, 
+                                        hash: hashHex, 
+                                        trust_score: trustScoreRef.current, 
+                                        signature: sig 
+                                    })
+                                });
+                                seg++;
+                            } catch (netErr) { 
+                                console.warn(`[PPAH Network] Hash verification failed for segment ${seg}:`, netErr);
+                                // Fallback: Continue without terminating session for transient network issues
+                            }
+                        } catch (hashErr) {
+                            console.error(`[PPAH Hash Error] Failed to compute hash for segment ${seg}:`, hashErr);
+                            // Fallback: Skip this frame and continue monitoring
                         }
-                    } catch (hashErr) {
-                        console.error(`[PPAH Hash Error] Failed to compute hash for segment ${seg}:`, hashErr);
-                        // Fallback: Skip this frame and continue monitoring
                     }
                 }
 
