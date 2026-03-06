@@ -147,8 +147,7 @@ Google Chrome is required as it supports WebAuthn.
 **Proprietary Research Software.** Developed for the "Privacy-Preserving Adaptive Hashing" academic study. Unauthorized distribution is prohibited.
 
 ## Citation
-Dighomanor, J. (2026).
-Privacy-Preserving Adaptive Hashing for Securing Remote Sessions.
+Dighomanor, J. (2026). Privacy-Preserving Adaptive Hashing for Securing Remote Sessions.
 Zenodo DOI: https://doi.org/10.5281/zenodo.18877533
 
 ---
