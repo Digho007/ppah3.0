@@ -40,8 +40,8 @@ logger = logging.getLogger("PPAH_Server")
 app = FastAPI(title="PPAH Enhanced Verification API - SCALABLE")
 
 # Config
-# NGROK_DOMAIN = "jim-peaceable-inconsequently.ngrok-free.dev"
-NGROK_DOMAIN = "inseparable-lochlan-bloodily.ngrok-free.dev"
+NGROK_DOMAIN = "jim-peaceable-inconsequently.ngrok-free.dev"
+# NGROK_DOMAIN = "inseparable-lochlan-bloodily.ngrok-free.dev"
 if NGROK_DOMAIN:
     RP_ID = NGROK_DOMAIN
     RP_NAME = "PPAH Remote"
